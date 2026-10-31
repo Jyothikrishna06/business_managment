@@ -45,7 +45,7 @@ function shell(){
   app.querySelector('#overlay').onclick=()=>document.body.classList.remove('nav-open');
   app.querySelector('#search').oninput=e=>{query=e.target.value;render();};
   app.querySelector('#account').onclick=()=>{accountOpen=!accountOpen;accountMenu();};
-  app.querySelector('#help').onclick=()=>toast('Add products and plans, create a customer and subscription, then run billing.');bindNavigation();
+  app.querySelector('#help').onclick=()=>toast('Add products and plans, create a customer and subscription, then run billing.');bindNavigation();render();
 }
 function bindNavigation(){app.querySelectorAll('[data-page]').forEach(b=>b.onclick=()=>{page=b.dataset.page;statusFilter='';query='';app.querySelector('#search').value='';document.body.classList.remove('nav-open');accountOpen=false;accountMenu();app.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===page));render();});}
 function accountMenu(){document.querySelector('#accountMenu').innerHTML=accountOpen?`<section class="account-popover"><p>${esc(user.email)}</p><div class="avatar">${esc(initials(user.name))}</div><h2>Hi, ${esc(user.name.split(' ')[0])}!</h2><p>${esc(user.role)} account</p><button class="outline-button" data-page="profile">Manage your account</button><br><button class="text-button" id="logout">${icon('logout')}Sign out</button></section>`:'';bindNavigation();if(accountOpen)document.querySelector('#logout').onclick=async()=>{await api('/auth/logout','POST');user=null;data={};page='overview';auth();};}
