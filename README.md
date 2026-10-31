@@ -69,7 +69,7 @@ The server binds to loopback. Before hosting, configure HTTPS, secure cookies an
 
 ## Brightloop software customer portal
 
-This customer branch demonstrates the Subscription Management System problem statement using fictional software and services. It replaces the device, health-reading and physical-band experience with a Google-inspired customer overview, product catalog, subscriptions, invoices, payments and account pages. Legacy image assets remain in repository history/files but are not used by the software portal.
+This branch demonstrates the Subscription Management System problem statement using fictional software and services. It provides role-specific admin, staff and customer portals for the catalog, quotations, subscriptions, invoices, payments, notifications and account management.
 
 A product is the software or service sold. It has a name, product type, sales price, optional cost price, notes and brand variants. A billing plan links to that product and sets its cycle, price, minimum quantity, availability and permitted customer actions. A subscription is the authenticated customer's saved purchase record, including the selected variant and a snapshot of its price. Customer selections create Draft subscriptions for team confirmation; they do not charge a payment method. Customers cannot change prices, attach another customer's ID, create staff, modify catalog rules or access other customers' subscriptions/invoices/payments.
 
@@ -78,5 +78,7 @@ The sample INR products are Cloud Storage ₹499, CRM Software ₹999, Antivirus
 Start the server once to initialize an isolated demo database, then set `DATA_DIR` to that database directory and run `node scripts/seed-software-demo.js`. This repeatable setup adds six products, twelve plans and twenty fictional customer records with software subscriptions. It does not create sign-in accounts or payments, overwrite existing records, or reassign real customers. Public sign-up creates a private customer account; admins must explicitly link any pre-existing matching customer record after verifying ownership.
 
 Invoices retain each subscription's currency; records with no currency remain legacy USD. Reports filter INR and USD separately instead of adding incompatible currencies, and exports include a currency column. Password registration/reset/staff-creation validation follows the PDF: more than eight characters, uppercase, lowercase and a special character. Existing account sign-in, cookie sessions and recovery flow are retained.
+
+The application database remains the operational source of truth. An optional Excel operations snapshot can be exported for review, with separate Summary, Renewals, Subscriptions, Invoices and Payments sheets. This replaces the problem statement's manually maintained spreadsheet and quarterly revenue-report process; it is not a second place where staff must maintain records.
 
 Run `npm test`, or run `node tests/integration.test.js` and `node tests/software-portal.test.js` directly if process-isolated tests are blocked. Tests cover authentication/recovery, billing idempotency, payment accounting, INR/legacy currency behavior, the Basic/Odoo example, server-calculated pricing, customer ownership and plan-controlled actions. Demo performance tests do not establish the problem statement's two-second target at thousands-of-record scale.
