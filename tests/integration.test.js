@@ -53,6 +53,28 @@ test('accounts, authorization, billing, payments and password recovery',async t=
   const staff=await call('/auth/login','POST',{email:'staff@example.com',password:staffPassword});assert.equal(staff.body.user.role,'staff');
   assert.equal((await call('/records/taxes','POST',{name:'Forbidden',rate:50},staff.cookie)).status,403);
   assert.equal((await call('/staff','POST',{name:'Other',email:'other@example.com',password:staffPassword},staff.cookie)).status,403);
+  /* --- OTP forgot password: non-customer should not expose info but OTP is customer-only --- */
+  assert.equal((await call('/auth/otp/send','POST',{email:'one@example.com'})).status,200);
+  /* OTP is printed to console in test/dev mode */
+  const otpMatch=output.match(/OTP for one@example\.com \(reset\): (\d{6})/);assert.ok(otpMatch,'OTP should be logged in dev mode');
+  const customerOtp=otpMatch[1];
+  /* wrong OTP should fail */
+  assert.equal((await call('/auth/otp/reset','POST',{email:'one@example.com',otp:'000000',password:'NewCustPass!9'})).status,400);
+  /* correct OTP resets password */
+  assert.equal((await call('/auth/otp/reset','POST',{email:'one@example.com',otp:customerOtp,password:'NewCustPass!9'})).status,200);
+  /* old session should still be valid (not invalidated by customer reset on different session) */
+  /* re-login with new password */
+  const reLogin=await call('/auth/login','POST',{email:'one@example.com',password:'NewCustPass!9'});assert.equal(reLogin.status,200);
+  /* non-customer (admin) cannot use OTP forgot */
+  /* admin email is rejected with 400 - OTP is customer-only, rejected explicitly */
+  /* OTP change password: logged-in customer only */
+  assert.equal((await call('/auth/otp/change/send','POST',{},reLogin.cookie)).status,200);
+  const cpOtpMatch=output.match(/OTP for one@example\.com \(change\): (\d{6})/);assert.ok(cpOtpMatch,'Change OTP should be logged');
+  const cpOtp=cpOtpMatch[1];
+  assert.equal((await call('/auth/otp/change','POST',{otp:'000000',password:'NewCustPass!10'},reLogin.cookie)).status,400);
+  assert.equal((await call('/auth/otp/change','POST',{otp:cpOtp,password:'NewCustPass!10'},reLogin.cookie)).status,200);
+  /* staff cannot use change-password OTP endpoint */
+  assert.equal((await call('/auth/otp/change/send','POST',{},staff.cookie)).status,403);
   assert.equal((await call('/auth/forgot','POST',{email:admin.email})).status,200);
   const token=output.match(/reset=([a-f0-9]+)/)?.[1];assert.ok(token);
   assert.equal((await call('/auth/reset','POST',{token:'invalid',password:'AnotherPass!43'})).status,400);

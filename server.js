@@ -10,7 +10,7 @@ import nodemailer from 'nodemailer';
 const root = fileURLToPath(new URL('.', import.meta.url));
 mkdirSync(process.env.DATA_DIR || `${root}data`, { recursive: true });
 const db = new DatabaseSync(`${process.env.DATA_DIR || `${root}data`}/subscript.db`);
-db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT,email TEXT UNIQUE,password TEXT,role TEXT,status TEXT DEFAULT 'active'); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS resets(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS records(id TEXT PRIMARY KEY,type TEXT,body TEXT); CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,time TEXT,userId TEXT,action TEXT);`);
+db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT,email TEXT UNIQUE,password TEXT,role TEXT,status TEXT DEFAULT 'active'); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS resets(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS records(id TEXT PRIMARY KEY,type TEXT,body TEXT); CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,time TEXT,userId TEXT,action TEXT); CREATE TABLE IF NOT EXISTS otps(email TEXT PRIMARY KEY,code_hash TEXT,expires INTEGER,attempts INTEGER DEFAULT 0,purpose TEXT);`);
 try{db.exec(`ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'`);}catch{/* column may already exist */}
 const types = ['products','plans','customers','quotations','subscriptions','invoices','payments','discounts','taxes'];
 const hash = v => createHash('sha256').update(v).digest('hex');
@@ -110,6 +110,34 @@ function validate(type,r){
     if(type==='subscriptions'&&!['Draft','Quotation','Confirmed','Active','Paused','Closed'].includes(r.status))fail('Invalid status.');
   }
 }
+/* --- OTP helpers (customer-only password flows) --- */
+const OTP_TTL = 600000; /* 10 minutes */
+const OTP_MAX_ATTEMPTS = 5;
+function generateOtp() { return String(Math.floor(100000 + Math.random() * 900000)); }
+async function sendOtpMail(toEmail, otp, purpose) {
+  const subject = purpose === 'reset' ? 'Your Brightloop password reset code' : 'Your Brightloop password change code';
+  const text = `Your verification code is: ${otp}\n\nIt expires in 10 minutes. Do not share it with anyone.\nIf you did not request this, ignore this email.`;
+  if (process.env.SMTP_HOST) {
+    await nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: process.env.SMTP_PORT === '465', auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined }).sendMail({ from: process.env.MAIL_FROM, to: toEmail, subject, text });
+  } else {
+    console.log(`[DEV] OTP for ${toEmail} (${purpose}): ${otp}`);
+  }
+}
+function storeOtp(email, otp, purpose) {
+  db.prepare('INSERT OR REPLACE INTO otps(email,code_hash,expires,attempts,purpose) VALUES(?,?,?,0,?)').run(email, hash(otp), Date.now() + OTP_TTL, purpose);
+}
+function verifyOtp(email, code, purpose) {
+  const row = db.prepare('SELECT * FROM otps WHERE email=? AND purpose=?').get(email, purpose);
+  if (!row) fail('No OTP was requested for this email, or it has expired. Please request a new code.');
+  if (row.expires < Date.now()) { db.prepare('DELETE FROM otps WHERE email=?').run(email); fail('The code has expired. Please request a new code.'); }
+  if (row.attempts >= OTP_MAX_ATTEMPTS) { db.prepare('DELETE FROM otps WHERE email=?').run(email); fail('Too many incorrect attempts. Please request a new code.'); }
+  if (!timingSafeEqual(Buffer.from(hash(String(code)), 'hex'), Buffer.from(row.code_hash, 'hex'))) {
+    db.prepare('UPDATE otps SET attempts=attempts+1 WHERE email=?').run(email);
+    fail('The code is incorrect. Please check your email and try again.');
+  }
+  db.prepare('DELETE FROM otps WHERE email=?').run(email);
+}
+/* -------------------------------------------------- */
 const softwarePortal=createSoftwarePortal({all,put,uid,fail,audit,nextDate});
 const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http://localhost');const path=url.pathname;const send=(data,code=200,headers={})=>{res.writeHead(code,{'Content-Type':'application/json','Cache-Control':'no-store',...headers});res.end(JSON.stringify(data));};try{
   res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('X-Frame-Options','DENY');res.setHeader('Referrer-Policy','same-origin');
@@ -134,8 +162,49 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
   if(path==='/api/auth/reset'&&req.method==='POST'){
     throttle(req.socket.remoteAddress);if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');const r=db.prepare('SELECT * FROM resets WHERE token=? AND expires>?').get(hash(String(b.token)),Date.now());if(!r)fail('This link is invalid or expired. Request a new reset link.');db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),r.userId);db.prepare('DELETE FROM resets WHERE userId=?').run(r.userId);db.prepare('DELETE FROM sessions WHERE userId=?').run(r.userId);return send({ok:true});
   }
+  
+  /* ---- OTP: send code for forgot-password (customers only) ---- */
+  if(path==='/api/auth/otp/send'&&req.method==='POST'){
+    throttle(req.socket.remoteAddress);
+    if(!email)fail('Enter your email address.');
+    const u=db.prepare('SELECT * FROM users WHERE email=?').get(email);
+    if(u&&u.role!=='customer')fail('OTP password reset is available for customer accounts only. Contact your administrator.');
+    if(u&&(!process.env.SMTP_HOST&&process.env.DEV_RESET_LINKS!=='true'))fail('Email delivery is not configured. Contact your administrator.',503);
+    if(u){const otp=generateOtp();storeOtp(email,otp,'reset');await sendOtpMail(email,otp,'reset');}
+    return send({message:'If a customer account exists for that email, a 6-digit code has been sent. It expires in 10 minutes.'});
+  }
+  /* ---- OTP: verify code and set new password (forgot flow) ---- */
+  if(path==='/api/auth/otp/reset'&&req.method==='POST'){
+    throttle(req.socket.remoteAddress);
+    if(!email)fail('Enter your email address.');
+    if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');
+    const u=db.prepare('SELECT * FROM users WHERE email=?').get(email);
+    if(!u||u.role!=='customer')fail('No customer account found for this email.');
+    verifyOtp(email,String(b.otp||''),'reset');
+    db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),u.id);
+    db.prepare('DELETE FROM sessions WHERE userId=?').run(u.id);
+    audit(u,'Customer reset password via OTP');
+    return send({ok:true});
+  }
   const token=(req.headers.cookie||'').split(';').map(c=>c.trim()).find(c=>c.startsWith('session='))?.slice(8);const session=token&&db.prepare('SELECT * FROM sessions WHERE token=? AND expires>?').get(hash(token),Date.now());const u=session&&db.prepare('SELECT * FROM users WHERE id=?').get(session.userId);if(!u)fail('Please sign in.',401);
   if(path==='/api/auth/me'&&req.method==='GET')return send({user:publicUser(u)});
+  /* ---- OTP: send code for change-password (logged-in customers only) ---- */
+  if(path==='/api/auth/otp/change/send'&&req.method==='POST'){
+    if(u.role!=='customer')fail('This action is available for customer accounts only.',403);
+    throttle(u.id);
+    const otp=generateOtp();storeOtp(u.email,otp,'change');await sendOtpMail(u.email,otp,'change');
+    return send({message:'A 6-digit code has been sent to your registered email. It expires in 10 minutes.'});
+  }
+  /* ---- OTP: verify code and update password (change flow) ---- */
+  if(path==='/api/auth/otp/change'&&req.method==='POST'){
+    if(u.role!=='customer')fail('This action is available for customer accounts only.',403);
+    throttle(u.id);
+    if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');
+    verifyOtp(u.email,String(b.otp||''),'change');
+    db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),u.id);
+    audit(u,'Customer changed password via OTP');
+    return send({ok:true});
+  }
   if(path==='/api/auth/logout'&&req.method==='POST'){db.prepare('DELETE FROM sessions WHERE token=?').run(hash(token));return send({ok:true},200,{'Set-Cookie':'session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'});}
   if(path==='/api/profile'&&req.method==='POST'){if(!b.name?.trim())fail('Name is required.');db.prepare('UPDATE users SET name=? WHERE id=?').run(b.name.trim(),u.id);const cust=all('customers').find(c=>c.userId===u.id||c.email===u.email);if(cust)put('customers',{...cust,name:b.name.trim()});audit(u,'Updated profile name');return send({user:{...publicUser(u),name:b.name.trim()}});}
   if(path==='/api/state'&&req.method==='GET'){const data=Object.fromEntries(types.map(t=>[t,all(t)]));if(u.role==='customer'){data.catalog=softwarePortal.catalog();const ids=data.customers.filter(c=>c.userId===u.id).map(c=>c.id);for(const t of ['subscriptions','quotations','invoices'])data[t]=data[t].filter(r=>ids.includes(r.customerId));const invoices=data.invoices.map(i=>i.id);data.payments=data.payments.filter(p=>invoices.includes(p.invoiceId));data.customers=data.customers.filter(c=>ids.includes(c.id));data.products=data.products.filter(p=>data.subscriptions.some(s=>s.productId===p.id)).map(({id,name,price,currency})=>({id,name,price,currency}));data.discounts=[];data.taxes=[];}return send(data);}
