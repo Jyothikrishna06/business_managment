@@ -1,3 +1,4 @@
+import {createExpiryMailer} from './expiry-mail.js';
 import {createSoftwarePortal} from './software-server.js';
 import {createExcelReport,reportSchema} from './excel-report.js';
 import http from 'node:http';
@@ -47,7 +48,7 @@ function calculate(s,date,context={}){
   const discount=discounts.find(d=>d.id===s.discountId);
   const eligible=discount?.scope==='Product'&&discount.productId?prepared.filter(line=>line.productId===discount.productId):prepared;
   const eligibleSubtotal=round(eligible.reduce((sum,line)=>sum+line.subtotal,0)),eligibleQuantity=eligible.reduce((sum,line)=>sum+line.quantity,0);
-  const applies=discount&&(!discount.starts||discount.starts<=date)&&(!discount.ends||discount.ends>=date)&&(!discount.limit||Number(discount.used||0)<Number(discount.limit))&&eligibleQuantity>=Number(discount.minQuantity||1)&&eligibleSubtotal>=Number(discount.minPurchase||0);
+  const applies=discount&&(discount.kind==='Percentage'||!discount.currency||discount.currency===(s.currency||'USD'))&&(!discount.starts||discount.starts<=date)&&(!discount.ends||discount.ends>=date)&&(!discount.limit||Number(discount.used||0)<Number(discount.limit))&&eligibleQuantity>=Number(discount.minQuantity||1)&&eligibleSubtotal>=Number(discount.minPurchase||0);
   let deduction=applies?(discount.kind==='Percentage'?eligibleSubtotal*Number(discount.value)/100:Number(discount.value)):0;deduction=round(Math.min(eligibleSubtotal,deduction));
   let remainingDiscount=deduction,eligibleRemaining=eligible.length;
   const invoiceLines=prepared.map(line=>{const eligibleLine=eligible.includes(line);let lineDiscount=0;if(eligibleLine&&deduction){eligibleRemaining--;lineDiscount=eligibleRemaining===0?remainingDiscount:round(deduction*(line.subtotal/Math.max(eligibleSubtotal,1)));lineDiscount=Math.min(line.subtotal,remainingDiscount,lineDiscount);remainingDiscount=round(remainingDiscount-lineDiscount);}const taxRule=taxes.find(t=>t.id===line.taxId);const tax=round((line.subtotal-lineDiscount)*Number(taxRule?.rate||0)/100);return {...line,discount:lineDiscount,tax,total:round(line.subtotal-lineDiscount+tax)};});
@@ -56,7 +57,6 @@ function calculate(s,date,context={}){
 }
 function nextDate(date,cycle,anchor){ const d=new Date(`${date}T12:00:00Z`); const day=d.getUTCDate(); if(cycle==='Daily')d.setUTCDate(day+1);else if(cycle==='Weekly')d.setUTCDate(day+7);else {d.setUTCDate(1);if(cycle==='Yearly')d.setUTCFullYear(d.getUTCFullYear()+1);else d.setUTCMonth(d.getUTCMonth()+1);const last=new Date(Date.UTC(d.getUTCFullYear(),d.getUTCMonth()+1,0)).getUTCDate();d.setUTCDate(Math.min(anchor||day,last));}return d.toISOString().slice(0,10); }
 function bill(){
-  subscriptionAutomation();
   const today=new Date().toISOString().slice(0,10),subscriptions=all('subscriptions'),plans=new Map(all('plans').map(item=>[item.id,item])),customers=new Map(all('customers').map(item=>[item.id,item])),invoices=all('invoices'),invoicePeriods=new Set(invoices.map(item=>`${item.subscriptionId}:${item.billingDate}`)),context={products:all('products'),taxes:all('taxes'),discounts:all('discounts')};let count=0;db.exec('BEGIN IMMEDIATE');
   try{for(const s of subscriptions){
     if(s.status!=='Active')continue;const plan=plans.get(s.planId);let due=s.nextBilling||s.starts;let n=0;
@@ -65,7 +65,7 @@ function bill(){
       if(!invoicePeriods.has(`${s.id}:${due}`)){
         const totals=calculate(s,due,context),customer=customers.get(s.customerId);
         const dueDate=new Date(`${due}T12:00:00Z`);dueDate.setUTCDate(dueDate.getUTCDate()+Number(String(s.terms||'').match(/Net (7|15|30|60)/)?.[1]||0));
-        put('invoices',{id:uid(),number:`INV-${uid().slice(0,8).toUpperCase()}`,customerId:s.customerId,subscriptionId:s.id,billingDate:due,due:dueDate.toISOString().slice(0,10),currency:s.currency||'INR',status:totals.total===0?'Paid':'Draft',line:totals.lines[0],lines:totals.lines,customer:{name:customer?.name||'Customer',email:customer?.email||''},terms:s.terms||'',...totals});invoicePeriods.add(`${s.id}:${due}`);count++;
+        put('invoices',{id:uid(),number:`INV-${uid().slice(0,8).toUpperCase()}`,customerId:s.customerId,subscriptionId:s.id,billingDate:due,due:dueDate.toISOString().slice(0,10),currency:s.currency||'USD',status:totals.total===0?'Paid':'Draft',line:totals.lines[0],lines:totals.lines,customer:{name:customer?.name||'Customer',email:customer?.email||''},terms:s.terms||'',...totals});invoicePeriods.add(`${s.id}:${due}`);count++;
         if(totals.discount&&s.discountId){const d=context.discounts.find(item=>item.id===s.discountId),updated={...d,used:Number(d.used||0)+1};put('discounts',updated);context.discounts=context.discounts.map(item=>item.id===updated.id?updated:item);}
       }
       due=nextDate(due,s.cycle||'Monthly',Number(s.starts.slice(8,10)));
@@ -73,64 +73,20 @@ function bill(){
     if(plan?.autoClose===true&&s.ends&&s.ends<today&&due>s.ends)s.status='Closed';s.nextBilling=due;put('subscriptions',s);
   }db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}return count;
 }
-async function sendExpiryEmail(subscription,stage,daysRemaining){
-  const existing=db.prepare('SELECT id FROM expiry_notices WHERE subscriptionId=? AND stage=?').get(subscription.id,stage);
-  if(existing)return;
-  const customer=all('customers').find(c=>c.id===subscription.customerId);
-  if(!customer?.email)return;
-  db.prepare('INSERT OR IGNORE INTO expiry_notices VALUES(?,?,?,?)').run(uid(),subscription.id,stage,new Date().toISOString());
-  const product=all('products').find(p=>p.id===subscription.productId)||{name:'Product'};
-  const currentPlan=all('plans').find(p=>p.id===subscription.planId)||{};
-  const availablePlans=all('plans').filter(p=>p.productId===subscription.productId);
-  const currency=subscription.currency||product.currency||'INR';
-  const fmt=val=>new Intl.NumberFormat('en-IN',{style:'currency',currency,maximumFractionDigits:2}).format(Number(val||0));
-  const appUrl=process.env.APP_URL||'http://localhost:3000';
-  let subject='',headline='',desc='';
-  if(stage==='week_before'){
-    subject=`Notice: Your ${product.name} subscription expires in 7 days`;
-    headline='Subscription Expiry Notice — 7 Days Remaining';
-    desc=`Your subscription (${subscription.number}) for ${product.name} will expire on ${subscription.ends} (in 7 days).`;
-  }else if(stage==='day_before'){
-    subject=`Urgent: Your ${product.name} subscription expires tomorrow`;
-    headline='Urgent Notice — 1 Day Remaining';
-    desc=`Your subscription (${subscription.number}) for ${product.name} will expire tomorrow on ${subscription.ends}.`;
-  }else{
-    subject=`Notice: Your ${product.name} subscription expires today`;
-    headline='Subscription Expiration Notice — Expires Today';
-    desc=`Your subscription (${subscription.number}) for ${product.name} reaches its expiration date today (${subscription.ends}).`;
-  }
-  const plansText=availablePlans.length
-    ? availablePlans.map(p=>`  • ${p.name}: ${fmt(p.price)} / ${p.cycle||'Monthly'}${p.minQuantity>1?` (Min qty: ${p.minQuantity})`:''}`).join('\n')
-    : '  • Contact support for renewal plan options.';
-  const plansHtml=availablePlans.length
-    ? availablePlans.map(p=>`<tr style="border-bottom:1px solid #e0e0e0"><td style="padding:10px 14px;font-weight:600;color:#192536">${p.name}</td><td style="padding:10px 14px;color:#1967d2;font-weight:600">${fmt(p.price)}</td><td style="padding:10px 14px;color:#5f6368">${p.cycle||'Monthly'}</td><td style="padding:10px 14px;color:#5f6368">${p.minQuantity||1} unit(s)</td></tr>`).join('')
-    : '<tr><td colspan="4" style="padding:12px;color:#777">Contact support for renewal plan options.</td></tr>';
-  const textBody=`Hello ${customer.name||'Customer'},\n\n${headline}\n${desc}\n\nSUBSCRIPTION DETAILS:\n• Subscription Number: ${subscription.number}\n• Product: ${product.name}${subscription.variantName?` (${subscription.variantName})`:''}\n• Current Plan: ${currentPlan.name||'Standard'} (${subscription.cycle||'Monthly'})\n• Expiry Date: ${subscription.ends}\n• Quantity & Rate: ${subscription.quantity} × ${fmt(subscription.unitPrice)}\n\nAVAILABLE PLANS FOR ${product.name.toUpperCase()}:\n${plansText}\n\nTo renew or change your plan, sign in to your Brightloop portal:\n${appUrl}\n\nThank you,\nBrightloop Software Support Team`;
-  const htmlBody=`<div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px;color:#202124;background:#fff;border:1px solid #e0e0e0;border-radius:12px"><div style="border-bottom:2px solid #1967d2;padding-bottom:14px;margin-bottom:20px"><h2 style="color:#1967d2;margin:0;font-size:22px">Brightloop Software</h2><p style="margin:4px 0 0;color:#5f6368;font-size:13px">Subscription & Plan Expiry Notification</p></div><div style="background:#f1f5fd;border-left:4px solid #1967d2;padding:14px 18px;margin-bottom:22px;border-radius:4px"><strong style="color:#174ea6;font-size:16px;display:block;margin-bottom:6px">${headline}</strong><p style="margin:0;font-size:14px;color:#3c4043;line-height:1.5">${desc}</p></div><h3 style="font-size:15px;color:#192536;margin-bottom:10px">Subscription Summary</h3><table style="width:100%;border-collapse:collapse;margin-bottom:24px;font-size:13px"><tr style="background:#fafafa"><td style="padding:8px 12px;font-weight:bold;width:40%">Subscription Number:</td><td style="padding:8px 12px">${subscription.number}</td></tr><tr><td style="padding:8px 12px;font-weight:bold">Product:</td><td style="padding:8px 12px">${product.name}${subscription.variantName?` · ${subscription.variantName}`:''}</td></tr><tr style="background:#fafafa"><td style="padding:8px 12px;font-weight:bold">Current Plan:</td><td style="padding:8px 12px">${currentPlan.name||'Standard'} (${subscription.cycle||'Monthly'})</td></tr><tr><td style="padding:8px 12px;font-weight:bold">Expiry Date:</td><td style="padding:8px 12px;color:#b3261e;font-weight:bold">${subscription.ends}</td></tr><tr style="background:#fafafa"><td style="padding:8px 12px;font-weight:bold">Quantity & Rate:</td><td style="padding:8px 12px">${subscription.quantity} × ${fmt(subscription.unitPrice)}</td></tr></table><h3 style="font-size:15px;color:#192536;margin-bottom:10px">Available Plans for ${product.name}</h3><table style="width:100%;border-collapse:collapse;margin-bottom:24px;font-size:13px"><thead><tr style="background:#e8f0fe;color:#174ea6;text-align:left"><th style="padding:10px 14px">Plan</th><th style="padding:10px 14px">Price</th><th style="padding:10px 14px">Cycle</th><th style="padding:10px 14px">Min Qty</th></tr></thead><tbody>${plansHtml}</tbody></table><div style="text-align:center;margin:30px 0 20px"><a href="${appUrl}" style="background:#1967d2;color:#fff;text-decoration:none;padding:12px 28px;border-radius:24px;font-weight:bold;font-size:14px;display:inline-block">Sign In & Renew Plan</a></div><div style="border-top:1px solid #e0e0e0;padding-top:16px;margin-top:24px;font-size:12px;color:#757575"><p style="margin:0 0 6px">Questions? Reply to this email or sign in to your Brightloop customer portal.</p><p style="margin:0">Brightloop Software Inc. · Automated Subscription Management</p></div></div>`;
-  notify(customerUserId(subscription.customerId),headline,desc,`subscription-expiry-${stage}`,subscription.id);
-  notifyRoles(`Subscription Expiry Notice (${stage.replace('_',' ')})`,`${subscription.number} (${customer.name}) expires ${subscription.ends}.`,`subscription-expiry-${stage}-staff`,subscription.id);
-  if(process.env.SMTP_HOST){
-    try{
-      await nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:process.env.SMTP_PORT==='465',auth:process.env.SMTP_USER?{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}:undefined}).sendMail({from:process.env.MAIL_FROM||'no-reply@brightloop.local',to:customer.email,subject,text:textBody,html:htmlBody});
-      audit({id:'system',name:'Automation'},`Sent ${stage} expiry email to ${customer.email} for ${subscription.number}`);
-    }catch(err){console.error(`Failed to send ${stage} expiry email to ${customer.email}:`,err.message);}
-  }else{
-    console.log(`[Expiry Email - ${stage}] to ${customer.email}: ${subject} (Expires: ${subscription.ends})`);
-  }
-}
+const sendExpiryEmail=createExpiryMailer({db,all,uid,notify,notifyRoles,audit});
 function subscriptionAutomation(){
   const today=new Date().toISOString().slice(0,10),plans=all('plans');
   for(const subscription of all('subscriptions')){
-    if(['Closed','Draft'].includes(subscription.status))continue;
+    if(!['Confirmed','Active','Paused'].includes(subscription.status)&&!(subscription.status==='Closed'&&subscription.closedReason==='Plan ended automatically'))continue;
     if(!subscription.ends)continue;
     const todayMs=new Date(`${today}T00:00:00Z`).getTime();
     const endMs=new Date(`${subscription.ends}T00:00:00Z`).getTime();
     const daysRemaining=Math.round((endMs-todayMs)/86400000);
     if(daysRemaining<=7&&daysRemaining>1)sendExpiryEmail(subscription,'week_before',daysRemaining).catch(e=>console.error('Expiry mail error',e.message));
     if(daysRemaining<=1&&daysRemaining>0)sendExpiryEmail(subscription,'day_before',daysRemaining).catch(e=>console.error('Expiry mail error',e.message));
-    if(daysRemaining<=0)sendExpiryEmail(subscription,'on_expiry',daysRemaining).catch(e=>console.error('Expiry mail error',e.message));
+    if(daysRemaining<=0&&daysRemaining>=-7)sendExpiryEmail(subscription,'on_expiry',daysRemaining).catch(e=>console.error('Expiry mail error',e.message));
     const plan=plans.find(p=>p.id===subscription.planId);
-    if(plan?.autoClose===true&&daysRemaining<0){
+    if(subscription.status!=='Closed'&&plan?.autoClose===true&&daysRemaining<0){
       put('subscriptions',{...subscription,status:'Closed',closedReason:'Plan ended automatically'});
       notifyRoles('Subscription closed automatically',`${subscription.number||'Subscription'} reached its configured end date.`,'subscription-auto-closed',subscription.id);
       notify(customerUserId(subscription.customerId),'Subscription ended',`${subscription.number||'Your subscription'} reached its end date and was closed.`,'subscription-auto-closed-customer',subscription.id);
@@ -162,7 +118,7 @@ function validate(type,r){
   }
   if(type==='plans'&&!['Daily','Weekly','Monthly','Yearly'].includes(r.cycle))fail('Choose a billing cycle.');
   if(type==='discounts'&&!['Fixed','Percentage'].includes(r.kind))fail('Choose a discount type.');
-  if(type==='discounts'){r.scope=r.scope||'Subscription';if(!['Subscription','Product'].includes(r.scope))fail('Choose a valid discount scope.');if(r.scope==='Product'&&!all('products').some(p=>p.id===r.productId))fail('Choose the product this discount applies to.');if(r.scope==='Subscription')r.productId='';}
+  if(type==='discounts'){r.scope=r.scope||'Subscription';if(!['Subscription','Product'].includes(r.scope))fail('Choose a valid discount scope.');if(r.scope==='Product'&&!all('products').some(p=>p.id===r.productId))fail('Choose the product this discount applies to.');if(r.scope==='Subscription')r.productId='';if(r.currency&&!['INR','USD'].includes(r.currency))fail('Choose INR or USD.');}
   if(type==='taxes'&&Number(r.rate)>100)fail('Tax rate cannot exceed 100%.');
   if(type==='discounts'&&r.kind==='Percentage'&&Number(r.value)>100)fail('Discount cannot exceed 100%.');
   for(const key of ['starts','ends','due','date'])if(r[key] && (!/^\d{4}-\d{2}-\d{2}$/.test(r[key])||!Number.isFinite(Date.parse(r[key]))))fail('Enter valid dates.');
@@ -212,7 +168,7 @@ function verifyOtp(email, code, purpose) {
   db.prepare('DELETE FROM otps WHERE email=?').run(email);
 }
 /* -------------------------------------------------- */
-const softwarePortal=createSoftwarePortal({all,put,uid,fail,audit,nextDate});
+const softwarePortal=createSoftwarePortal({all,put,uid,fail,audit,nextDate,calculate,db,notifyQuotation});
 const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http://localhost');const path=url.pathname;const send=(data,code=200,headers={})=>{res.writeHead(code,{'Content-Type':'application/json','Cache-Control':'no-store',...headers});res.end(JSON.stringify(data));};try{
   res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('X-Frame-Options','DENY');res.setHeader('Referrer-Policy','same-origin');
   if(!path.startsWith('/api/')){const files={'/':'index.html','/index.html':'index.html','/app.js':'app.js','/customer-portal.js':'customer-portal.js','/styles.css':'styles.css','/theme.css':'theme.css'};if(files[path]){res.setHeader('Content-Type',path.endsWith('.js')?'text/javascript':path.endsWith('.css')?'text/css':'text/html');res.end(readFileSync(`${root}${files[path]}`));return;}if(path.startsWith('/assets/')){const assetRoot=resolve(root,'assets'),assetPath=resolve(root,`.${decodeURIComponent(path)}`);if(!assetPath.startsWith(`${assetRoot}${sep}`)||!existsSync(assetPath))return send({error:'Not found'},404);const mime={'.png':'image/png','.webp':'image/webp','.jpg':'image/jpeg','.jpeg':'image/jpeg'}[extname(assetPath).toLowerCase()];if(!mime)return send({error:'Unsupported asset type'},415);res.setHeader('Content-Type',mime);res.setHeader('Cache-Control','public, max-age=3600');res.end(readFileSync(assetPath));return;}return send({error:'Not found'},404);}
@@ -282,7 +238,7 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
   }
   if(path==='/api/auth/logout'&&req.method==='POST'){db.prepare('DELETE FROM sessions WHERE token=?').run(hash(token));return send({ok:true},200,{'Set-Cookie':'session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'});}
   if(path==='/api/profile'&&req.method==='POST'){if(!b.name?.trim())fail('Name is required.');db.prepare('UPDATE users SET name=? WHERE id=?').run(b.name.trim(),u.id);for(const cust of all('customers').filter(c=>c.userId===u.id))put('customers',{...cust,name:b.name.trim()});audit(u,'Updated profile name');return send({user:{...publicUser(u),name:b.name.trim()}});}
-  if(path==='/api/notifications'&&req.method==='GET'){quotationAutomation();const items=db.prepare('SELECT id,title,message,type,referenceId,createdAt,readAt FROM notifications WHERE userId=? ORDER BY createdAt DESC LIMIT 30').all(u.id);return send({items,unread:items.filter(n=>!n.readAt).length});}
+  if(path==='/api/notifications'&&req.method==='GET'){quotationAutomation();const items=db.prepare('SELECT id,title,message,type,referenceId,createdAt,readAt FROM notifications WHERE userId=? ORDER BY createdAt DESC LIMIT 30').all(u.id);return send({items,unread:db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE userId=? AND readAt IS NULL').get(u.id).n});}
   if(path==='/api/notifications/all'&&req.method==='POST'){db.prepare('UPDATE notifications SET readAt=? WHERE userId=? AND readAt IS NULL').run(new Date().toISOString(),u.id);return send({ok:true});}
   const notificationMatch=path.match(/^\/api\/notifications\/([a-f0-9]+)\/read$/);if(notificationMatch&&req.method==='POST'){const item=db.prepare('SELECT id FROM notifications WHERE id=? AND userId=?').get(notificationMatch[1],u.id);if(!item)fail('Notification not found.',404);db.prepare('UPDATE notifications SET readAt=COALESCE(readAt,?) WHERE id=? AND userId=?').run(new Date().toISOString(),notificationMatch[1],u.id);return send({ok:true});}
   if(path==='/api/state'&&req.method==='GET'){subscriptionAutomation();const data=Object.fromEntries(types.map(t=>[t,all(t)]));if(u.role==='staff')data.products=data.products.map(({cost,...p})=>p);if(u.role==='customer'){data.demoCheckout=process.env.ENABLE_DEMO_CHECKOUT==='true';data.catalog=softwarePortal.catalog();const ids=data.customers.filter(c=>c.userId===u.id).map(c=>c.id);for(const t of ['subscriptions','quotations','invoices'])data[t]=data[t].filter(r=>ids.includes(r.customerId));const invoices=data.invoices.map(i=>i.id);data.payments=data.payments.filter(p=>invoices.includes(p.invoiceId));data.customers=data.customers.filter(c=>ids.includes(c.id));const ownedProductIds=new Set(data.subscriptions.flatMap(s=>recordLines(s).map(line=>line.productId)));data.products=data.products.filter(p=>ownedProductIds.has(p.id)).map(({id,name,price,currency})=>({id,name,price,currency}));data.quotationTemplates=[];data.discounts=[];data.taxes=[];}return send(data);}
@@ -312,12 +268,12 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
     const i=all('invoices').find(i=>i.id===b.id);if(!i)fail('Invoice not found.',404);
     if(b.action==='confirm'){if(i.status!=='Draft')fail('Only a draft invoice can be confirmed.');put('invoices',{...i,status:'Confirmed',confirmedAt:new Date().toISOString()});notify(customerUserId(i.customerId),'Invoice confirmed',`${i.number} is confirmed and due on ${i.due}.`,'invoice-confirmed-customer',i.id);}
     else if(b.action==='cancel'){if(!['Draft','Confirmed'].includes(i.status))fail('Only an unpaid invoice can be cancelled.');if(all('payments').some(p=>p.invoiceId===i.id))fail('An invoice with payments cannot be cancelled.');put('invoices',{...i,status:'Cancelled'});}
-    else if(b.action==='send'){if(!['Confirmed','Paid'].includes(i.status))fail('Confirm this invoice before sending it.');if(!process.env.SMTP_HOST)fail('Configure SMTP to email invoices.',503);const c=all('customers').find(c=>c.id===i.customerId);if(!c)fail('Invoice customer not found.',404);const currency=i.currency||'INR';const formatAmount=value=>new Intl.NumberFormat('en-IN',{style:'currency',currency,maximumFractionDigits:2}).format(Number(value||0));await nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:process.env.SMTP_PORT==='465',auth:process.env.SMTP_USER?{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}:undefined}).sendMail({from:process.env.MAIL_FROM,to:c.email,subject:`Invoice ${i.number}`,text:`Hello ${c.name},\nInvoice ${i.number}\nDue: ${i.due}\nSubtotal: ${formatAmount(i.subtotal)}\nDiscount: ${formatAmount(i.discount)}\nTax: ${formatAmount(i.tax)}\nTotal: ${formatAmount(i.total)}\nPlease sign in to your Brightloop portal to view your invoice.`});}
+    else if(b.action==='send'){if(!['Confirmed','Paid'].includes(i.status))fail('Confirm this invoice before sending it.');if(!process.env.SMTP_HOST)fail('Configure SMTP to email invoices.',503);const c=all('customers').find(c=>c.id===i.customerId);if(!c)fail('Invoice customer not found.',404);const currency=i.currency||'USD';const formatAmount=value=>new Intl.NumberFormat('en-IN',{style:'currency',currency,maximumFractionDigits:2}).format(Number(value||0));await nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:process.env.SMTP_PORT==='465',auth:process.env.SMTP_USER?{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}:undefined}).sendMail({from:process.env.MAIL_FROM,to:c.email,subject:`Invoice ${i.number}`,text:`Hello ${c.name},\nInvoice ${i.number}\nDue: ${i.due}\nSubtotal: ${formatAmount(i.subtotal)}\nDiscount: ${formatAmount(i.discount)}\nTax: ${formatAmount(i.tax)}\nTotal: ${formatAmount(i.total)}\nPlease sign in to your Brightloop portal to view your invoice.`});}
     else fail('Invalid invoice action.');audit(u,`${b.action} invoice ${i.number}`);return send({ok:true});
   }
   if(path==='/api/convert'&&req.method==='POST'){
     const q=all('quotations').find(q=>q.id===b.id);if(!q)fail('Quotation not found.',404);if(q.subscriptionId)fail('This quotation has already been converted.');if(q.ends&&q.ends<new Date().toISOString().slice(0,10))fail('This quotation has expired.');
-    const s={...q,id:uid(),number:`SUB-${uid().slice(0,8).toUpperCase()}`,status:'Confirmed',ends:'',nextBilling:q.starts};validate('subscriptions',s);db.exec('BEGIN IMMEDIATE');try{put('subscriptions',s);put('quotations',{...q,status:'Confirmed',subscriptionId:s.id});db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}notifyQuotation(q,'converted');audit(u,'Converted quotation');return send(s);
+    const source=q.sourceSubscriptionId&&all('subscriptions').find(s=>s.id===q.sourceSubscriptionId&&s.customerId===q.customerId);if(q.sourceSubscriptionId&&(!source||source.status!=='Draft'))fail('The requested subscription is no longer awaiting confirmation.');const s={...q,...(source||{}),id:source?.id||uid(),number:source?.number||`SUB-${uid().slice(0,8).toUpperCase()}`,status:'Confirmed',ends:q.subscriptionEnds||'',nextBilling:q.starts};delete s.sourceSubscriptionId;validate('subscriptions',s);db.exec('BEGIN IMMEDIATE');try{put('subscriptions',s);put('quotations',{...q,status:'Confirmed',subscriptionId:s.id});db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}notifyQuotation(q,'converted');audit(u,'Converted quotation');return send(s);
   }
   if(path==='/api/billing'&&req.method==='POST'){const count=bill();audit(u,`Generated ${count} invoices`);return send({count});}
   if(path==='/api/staff'&&req.method==='POST'){if(u.role!=='admin')fail('Administrator access required.',403);if(!validPassword(b.password)||!/^\S+@\S+\.\S+$/.test(email)||!b.name?.trim())fail('Enter a name, valid email and a strong password.');if(db.prepare('SELECT id FROM users WHERE email=?').get(email))fail('Email already registered.');db.prepare('INSERT INTO users(id,name,email,password,role,status) VALUES(?,?,?,?,?,?)').run(uid(),b.name.trim(),email,passwordHash(b.password),'staff','active');audit(u,'Staff account created');return send({ok:true});}
@@ -328,13 +284,13 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
     if(type==='invoices')fail('Invoices are generated from subscriptions. Use invoice actions.');
     if(type==='subscriptions'&&old&&all('invoices').some(i=>i.subscriptionId===id)&&['starts','customerId','productId','planId','quantity','unitPrice','lines'].some(key=>b[key]!==undefined&&JSON.stringify(b[key])!==JSON.stringify(old[key])))fail('Billed contract details cannot be changed. Create a new subscription for pricing changes.');
     if(type==='payments'){if(Math.abs(Number(r.amount)*100-Math.round(Number(r.amount)*100))>0.00001)fail('Use at most two decimal places for a payment.');if(r.date>new Date().toISOString().slice(0,10))fail('Payment date cannot be in the future.');if(id)fail('Payments cannot be edited.');validate(type,r);const i=all('invoices').find(i=>i.id===r.invoiceId);if(!i||i.status!=='Confirmed')fail('Choose a confirmed unpaid invoice.');const paid=all('payments').filter(p=>p.invoiceId===i.id).reduce((s,p)=>s+Number(p.amount),0);if(!(Number(r.amount)>0)||Number(r.amount)>i.total-paid+0.001)fail('Amount exceeds the outstanding balance or is invalid.');if(!r.date||!['Bank transfer','Card','Cash','Other'].includes(r.method))fail('Payment date and method are required.');db.exec('BEGIN IMMEDIATE');try{put(type,r);put('invoices',{...i,status:paid+Number(r.amount)>=i.total-0.001?'Paid':'Confirmed'});db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}}
-    else {validate(type,r);if(type==='subscriptions'){assertSubscriptionTransition(old?.status,r.status);if(old&&all('invoices').some(i=>i.subscriptionId===id)&&['starts','customerId','lines'].some(k=>JSON.stringify(old[k])!==JSON.stringify(r[k])))fail('Billed contract details cannot be changed. Create a new subscription for pricing changes.');if(old&&old.status==='Paused'&&r.status==='Active'){let due=r.nextBilling||r.starts;const today=new Date().toISOString().slice(0,10);while(due<today)due=nextDate(due,r.cycle||'Monthly',Number(r.starts.slice(8,10)));r.nextBilling=due;}else{r.nextBilling=old?.nextBilling||r.starts;}}if(type==='customers'&&u.role==='staff'){r.userId=old?.userId||null;}else if(type==='customers'){const account=db.prepare('SELECT id FROM users WHERE email=? AND role=?').get(r.email,'customer');r.userId=account?.id||null;}if(type==='quotations'&&old?.subscriptionId)r.subscriptionId=old.subscriptionId;if(type==='discounts')r.used=old?.used||0;put(type,r);if(type==='quotations'&&!id)notifyQuotation(r,'created');}audit(u,`${id?'Updated':'Created'} ${type}: ${r.id}`);return send(r);
+    else {validate(type,r);if(type==='subscriptions'){assertSubscriptionTransition(old?.status,r.status);if(old&&all('invoices').some(i=>i.subscriptionId===id)&&['starts','customerId','lines'].some(k=>JSON.stringify(old[k])!==JSON.stringify(r[k])))fail('Billed contract details cannot be changed. Create a new subscription for pricing changes.');if(old&&old.status==='Paused'&&r.status==='Active'){let due=r.nextBilling||r.starts;const today=new Date().toISOString().slice(0,10);while(due<today)due=nextDate(due,r.cycle||'Monthly',Number(r.starts.slice(8,10)));r.nextBilling=due;}else{r.nextBilling=old?.nextBilling||r.starts;}}if(type==='customers'&&u.role==='staff'){r.userId=old?.userId||null;}else if(type==='customers'){const account=db.prepare('SELECT id FROM users WHERE email=? AND role=?').get(r.email,'customer');r.userId=account?.id||null;}if(type==='quotations'&&old?.subscriptionId)fail('Converted quotations cannot be edited.');if(type==='discounts')r.used=old?.used||0;put(type,r);if(type==='quotations'&&!id)notifyQuotation(r,'created');}audit(u,`${id?'Updated':'Created'} ${type}: ${r.id}`);return send(r);
   }
   if(req.method==='DELETE'){if(['payments','invoices','subscriptions'].includes(type))fail('Financial records are retained. Close or cancel them instead.');const references={customers:['customerId'],products:['productId'],plans:['planId'],discounts:['discountId'],taxes:['taxId']};if(types.some(t=>all(t).some(r=>(references[type]||[]).some(key=>r[key]===id))))fail('This record is in use and cannot be deleted.');db.prepare('DELETE FROM records WHERE id=? AND type=?').run(id,type);audit(u,`Deleted ${type}: ${id}`);return send({ok:true});}
   fail('Method not allowed',405);
 }catch(e){send({error:e.code&&typeof e.code==='number'?e.message:'The request could not be completed.'},typeof e.code==='number'?e.code:500);if(!e.code)console.error(e);}});
 server.listen(Number(process.env.PORT||3000),'127.0.0.1',()=>console.log(`Subscript running at ${process.env.APP_URL||'http://localhost:3000'}`));
-const timer=setInterval(()=>{try{subscriptionAutomation();bill();quotationAutomation();}catch(e){console.error('Scheduled automation error',e.message);}},60000);timer.unref();
+const timer=setInterval(()=>{try{bill();subscriptionAutomation();quotationAutomation();}catch(e){console.error('Scheduled automation error',e.message);}},60000);timer.unref();
 
-server.on('close',()=>{clearInterval(timer);db.close();});
+server.on('close',()=>{clearInterval(timer);sendExpiryEmail.close();db.close();});
 export {server,sendExpiryEmail,subscriptionAutomation,db};

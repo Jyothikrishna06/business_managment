@@ -9,7 +9,7 @@ import {seedSoftware} from '../scripts/seed-software-demo.js';
 
 test('Customer instant checkout with Pay Now skips staff approval and activates immediately', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'brightloop-paynow-'));
-  Object.assign(process.env, {PORT: '0', DATA_DIR: dir, BOOTSTRAP_ADMIN_EMAIL: 'admin@example.test', BOOTSTRAP_ADMIN_PASSWORD: 'AdminPass!42', SMTP_HOST: ''});
+  Object.assign(process.env, {PORT: '0', DATA_DIR: dir, BOOTSTRAP_ADMIN_EMAIL: 'admin@example.test', BOOTSTRAP_ADMIN_PASSWORD: 'AdminPass!42', SMTP_HOST: '', ENABLE_DEMO_CHECKOUT:'true'});
   const {server} = await import('../server.js');
   if (!server.listening) await once(server, 'listening');
   t.after(async () => {
