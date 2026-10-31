@@ -26,7 +26,7 @@ export function renderCustomerPortal(ctx){
  }else if(page==='profile'){
   title='Your account';content=panel('Personal information',`<form id="customerProfile" class="software-form"><div class="field"><label for="customerName">Full name</label><input id="customerName" name="name" maxlength="200" required value="${e(user.name)}"></div><div class="field"><label for="customerEmail">Email address</label><input id="customerEmail" disabled value="${e(user.email)}"></div><button class="primary-button">Save profile</button><p class="muted">To reset your password, sign out and choose “Forgot password?” on the sign-in page.</p></form>`);
  }else{title='Page unavailable';content='<div class="panel empty">This page is not available in the customer portal.</div>';}
- main.innerHTML=`<div class="page-heading"><div><span class="page-portal-label">Customer portal</span><h1>${title}</h1></div></div><p class="error" id="customerError" role="alert"></p>${content}`;
+ main.innerHTML=`<div class="page-heading"><div><h1>${title}</h1></div></div><p class="error" id="customerError" role="alert"></p>${content}`;
  main.querySelectorAll('[data-customer-page]').forEach(b=>b.onclick=()=>navigate(b.dataset.customerPage));
  async function save(button,path,body,method='POST'){button.disabled=true;try{const result=await api(path,method,body);await load();render();toast('Changes saved.');return result;}catch(error){main.querySelector('#customerError').textContent=error.message;}finally{button.disabled=false;}}
  main.querySelectorAll('[data-sub-action]').forEach(b=>b.onclick=()=>{if(b.dataset.subAction==='close'&&!confirm('Close this subscription? Future billing will stop.'))return;save(b,'/customer/subscriptions/'+b.dataset.id,{action:b.dataset.subAction},'PATCH');});
