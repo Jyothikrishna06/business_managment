@@ -1,4 +1,4 @@
-# Subscript Console
+# Aira Band Management Portal
 
 A local subscription-management application with a Google Search Console inspired interface, Roboto typography, Material Symbols, rounded navigation selection and pill filters.
 
@@ -21,6 +21,7 @@ The application has three separate role experiences: administrator, staff and cu
 - Salted scrypt password hashes, password validation and sign-in attempt limits.
 - Forgot-password email flow; hashed, single-use reset tokens valid for 30 minutes; resetting a password invalidates existing sessions.
 - Profile page and role restrictions enforced by the backend.
+- Aira Band customer dashboard with device connection state, activity rings and demo health readings for steps, calories, distance, exercise, heart rate, blood oxygen, sleep and recovery.
 - Create, edit and search products, plans, customers, discount rules and tax rules.
 - Quotation creation and conversion to a confirmed subscription.
 - Subscription activation, pause, close and renewal through a new contract.
