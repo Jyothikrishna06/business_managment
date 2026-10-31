@@ -144,18 +144,20 @@ function validate(type,r){
     if(type==='subscriptions'&&!['Draft','Quotation','Confirmed','Active','Paused','Closed'].includes(r.status))fail('Invalid status.');
   }
 }
-/* --- OTP helpers (customer-only password flows) --- */
+db.exec('CREATE TABLE IF NOT EXISTS recoveries(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER)');
+/* OTP recovery is available to every active account role. */
 const OTP_TTL = 600000; /* 10 minutes */
 const OTP_MAX_ATTEMPTS = 5;
 function generateOtp() { return String(randomInt(100000,1000000)); }
 async function sendOtpMail(toEmail, otp, purpose) {
-  const subject = purpose === 'reset' ? 'Your Brightloop password reset code' : 'Your Brightloop password change code';
+  const subject = purpose === 'reset' ? 'Your Brightloop sign-in recovery code' : 'Your Brightloop password change code';
   const text = `Your verification code is: ${otp}\n\nIt expires in 10 minutes. Do not share it with anyone.\nIf you did not request this, ignore this email.`;
   if (process.env.SMTP_HOST) {
-    await nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: process.env.SMTP_PORT === '465', auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined }).sendMail({ from: process.env.MAIL_FROM, to: toEmail, subject, text });
+    if(process.env.SMTP_HOST==='smtp.gmail.com'&&(!process.env.SMTP_USER||!process.env.SMTP_PASS))fail('Password recovery is temporarily unavailable. Please contact support.',503);
+    try{await nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:process.env.SMTP_PORT==='465',requireTLS:process.env.SMTP_PORT!=='465',connectionTimeout:10000,greetingTimeout:10000,socketTimeout:15000,auth:process.env.SMTP_USER?{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}:undefined}).sendMail({from:process.env.MAIL_FROM||process.env.SMTP_USER,to:toEmail,subject,text,html:`<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;color:#1b1d21"><h2>Brightloop</h2><p>${purpose==='reset'?'Use this code to recover your account.':'Use this code to change your password.'}</p><p style="font-size:36px;font-weight:bold;letter-spacing:8px;color:#0c6e34">${otp}</p><p>This code expires in 10 minutes and can be used once. Do not share it.</p><p>If you did not request this code, you can ignore this email.</p></div>`});}catch(error){console.error('Recovery email could not be delivered:',error.code||'SMTP error');fail('We could not send your code. Please try again later or contact support.',503);}
   } else if(process.env.DEV_RESET_LINKS==='true') {
     console.log(`[DEV] OTP for ${toEmail} (${purpose}): ${otp}`);
-  } else {fail('Email delivery is not configured. Contact your administrator.',503);}
+  } else {fail('Password recovery is temporarily unavailable. Please contact support.',503);}
 }
 function storeOtp(email, otp, purpose) {
   db.prepare('INSERT OR REPLACE INTO otps(email,code_hash,expires,attempts,purpose) VALUES(?,?,?,0,?)').run(email, hash(otp), Date.now() + OTP_TTL, purpose);
@@ -196,38 +198,39 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
     throttle(req.socket.remoteAddress);const u=db.prepare('SELECT * FROM users WHERE email=?').get(email);const [salt,saved]=(u?.password||`${uid()}:${'0'.repeat(128)}`).split(':');const computed=scryptSync(String(b.password||''),salt,64);if(!u||!timingSafeEqual(computed,Buffer.from(saved,'hex')))fail('Email or password is incorrect.',401);if(u.status==='deactivated')fail('This account has been deactivated. Contact your administrator.',403);
     const token=randomBytes(32).toString('hex');db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(hash(token),u.id,Date.now()+86400000);return send({user:publicUser(u)},200,{'Set-Cookie':`session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400${process.env.APP_URL?.startsWith('https')?'; Secure':''}`});
   }
-  if(path==='/api/auth/forgot'&&req.method==='POST'){
-    throttle(req.socket.remoteAddress);const u=db.prepare('SELECT * FROM users WHERE email=?').get(email);
-    if(!process.env.SMTP_HOST && process.env.DEV_RESET_LINKS!=='true')fail('Email delivery is not configured. Contact your administrator.',503);
-    if(u){const token=randomBytes(32).toString('hex');db.prepare('DELETE FROM resets WHERE userId=?').run(u.id);db.prepare('INSERT INTO resets VALUES(?,?,?)').run(hash(token),u.id,Date.now()+1800000);const link=`${process.env.APP_URL||'http://localhost:3000'}/?reset=${token}`;if(process.env.SMTP_HOST){await nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:process.env.SMTP_PORT==='465',auth:process.env.SMTP_USER?{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}:undefined}).sendMail({from:process.env.MAIL_FROM,to:email,subject:'Reset your Subscript password',text:`Reset your password using this link (expires in 30 minutes):\n${link}\nIf you did not request this, ignore this email.`});}else console.log(`Local password reset for ${email}: ${link}`);}
-    return send({message:'If an account exists, a password reset link has been requested. It expires in 30 minutes.'});
-  }
   if(path==='/api/auth/reset'&&req.method==='POST'){
-    throttle(req.socket.remoteAddress);if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');const r=db.prepare('SELECT * FROM resets WHERE token=? AND expires>?').get(hash(String(b.token)),Date.now());if(!r)fail('This link is invalid or expired. Request a new reset link.');db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),r.userId);db.prepare('DELETE FROM resets WHERE userId=?').run(r.userId);db.prepare('DELETE FROM sessions WHERE userId=?').run(r.userId);const resetUser=db.prepare('SELECT email FROM users WHERE id=?').get(r.userId);if(resetUser)db.prepare('DELETE FROM otps WHERE email=?').run(resetUser.email);return send({ok:true});
+    throttle(req.socket.remoteAddress);if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');const r=db.prepare('SELECT * FROM resets WHERE token=? AND expires>?').get(hash(String(b.token)),Date.now());if(!r)fail('This link is invalid or expired. Request a new reset link.');db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),r.userId);db.prepare('DELETE FROM resets WHERE userId=?').run(r.userId);db.prepare('DELETE FROM recoveries WHERE userId=?').run(r.userId);db.prepare('DELETE FROM sessions WHERE userId=?').run(r.userId);const resetUser=db.prepare('SELECT email FROM users WHERE id=?').get(r.userId);if(resetUser)db.prepare('DELETE FROM otps WHERE email=?').run(resetUser.email);return send({ok:true});
   }
 
-  /* ---- OTP: send code for forgot-password (customers only) ---- */
-  if(path==='/api/auth/otp/send'&&req.method==='POST'){
+  /* A recovery request sends only an OTP, never a reset link. */
+  if(['/api/auth/forgot','/api/auth/otp/send'].includes(path)&&req.method==='POST'){
     throttle(req.socket.remoteAddress);
-    if(!email)fail('Enter your email address.');
+    if(!/^\S+@\S+\.\S+$/.test(email))fail('Enter a valid email address.');
     const u=db.prepare('SELECT * FROM users WHERE email=?').get(email);
 
-    if(!process.env.SMTP_HOST&&process.env.DEV_RESET_LINKS!=='true')fail('Email delivery is not configured. Contact your administrator.',503);
-    if(u?.role==='customer'){const otp=generateOtp();storeOtp(email,otp,'reset');try{await sendOtpMail(email,otp,'reset');}catch(error){db.prepare('DELETE FROM otps WHERE email=?').run(email);throw error;}}
-    return send({message:'If a customer account exists for that email, a 6-digit code has been sent. It expires in 10 minutes.'});
+    if(!process.env.SMTP_HOST&&process.env.DEV_RESET_LINKS!=='true')fail('Password recovery is temporarily unavailable. Please contact support.',503);
+    if(u&&u.status!=='deactivated'){db.prepare('DELETE FROM recoveries WHERE userId=?').run(u.id);const otp=generateOtp();storeOtp(email,otp,'reset');try{await sendOtpMail(email,otp,'reset');}catch(error){db.prepare('DELETE FROM otps WHERE email=?').run(email);throw error;}}
+    return send({message:'If an active account exists for that email, a 6-digit code has been sent. It expires in 10 minutes.'});
   }
-  /* ---- OTP: verify code and set new password (forgot flow) ---- */
-  if(path==='/api/auth/otp/reset'&&req.method==='POST'){
-    throttle(req.socket.remoteAddress);
-    if(!email)fail('Enter your email address.');
-    if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');
-    const u=db.prepare('SELECT * FROM users WHERE email=?').get(email);
-    if(!u||u.role!=='customer')fail('The code is invalid or expired.');
+  if(path==='/api/auth/otp/verify'&&req.method==='POST'){
+    throttle(req.socket.remoteAddress);const account=db.prepare('SELECT * FROM users WHERE email=?').get(email);
+    if(!account||account.status==='deactivated')fail('The code is invalid or expired.');
     verifyOtp(email,String(b.otp||''),'reset');
-    db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),u.id);
-    db.prepare('DELETE FROM sessions WHERE userId=?').run(u.id);db.prepare('DELETE FROM resets WHERE userId=?').run(u.id);
-    audit(u,'Customer reset password via OTP');
-    return send({ok:true});
+    const recoveryToken=randomBytes(32).toString('hex');db.prepare('DELETE FROM recoveries WHERE userId=?').run(account.id);db.prepare('INSERT INTO recoveries VALUES(?,?,?)').run(hash(recoveryToken),account.id,Date.now()+300000);
+    return send({recoveryToken});
+  }
+  if(path==='/api/auth/otp/reset'&&req.method==='POST'){
+    throttle(req.socket.remoteAddress);if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');
+    let account;
+    if(b.recoveryToken){const recovery=db.prepare('SELECT userId FROM recoveries WHERE token=? AND expires>?').get(hash(String(b.recoveryToken)),Date.now());account=recovery&&db.prepare('SELECT * FROM users WHERE id=?').get(recovery.userId);}
+    else {account=db.prepare('SELECT * FROM users WHERE email=?').get(email);if(account&&account.status!=='deactivated')verifyOtp(email,String(b.otp||''),'reset');}
+    if(!account||account.status==='deactivated')fail('Your recovery session has expired. Request a new code.');
+    const sessionToken=randomBytes(32).toString('hex');db.exec('BEGIN IMMEDIATE');try{
+      db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),account.id);
+      db.prepare('DELETE FROM sessions WHERE userId=?').run(account.id);db.prepare('DELETE FROM resets WHERE userId=?').run(account.id);db.prepare('DELETE FROM otps WHERE email=?').run(account.email);db.prepare('DELETE FROM recoveries WHERE userId=?').run(account.id);
+      db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(hash(sessionToken),account.id,Date.now()+86400000);audit(account,'Recovered account using email OTP');db.exec('COMMIT');
+    }catch(error){db.exec('ROLLBACK');throw error;}
+    return send({ok:true,user:publicUser(account)},200,{'Set-Cookie':`session=${sessionToken}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400${process.env.APP_URL?.startsWith('https')?'; Secure':''}`});
   }
   const token=(req.headers.cookie||'').split(';').map(c=>c.trim()).find(c=>c.startsWith('session='))?.slice(8);const session=token&&db.prepare('SELECT * FROM sessions WHERE token=? AND expires>?').get(hash(token),Date.now());const u=session&&db.prepare('SELECT * FROM users WHERE id=?').get(session.userId);if(!u)fail('Please sign in.',401);if(u.status==='deactivated')fail('This account has been deactivated.',403);
   if(path==='/api/auth/me'&&req.method==='GET')return send({user:publicUser(u)});
@@ -235,7 +238,7 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
   if(path==='/api/auth/otp/change/send'&&req.method==='POST'){
     if(u.role!=='customer')fail('This action is available for customer accounts only.',403);
     throttle(u.id);
-    if(!process.env.SMTP_HOST&&process.env.DEV_RESET_LINKS!=='true')fail('Email delivery is not configured. Contact your administrator.',503);const otp=generateOtp();storeOtp(u.email,otp,'change');try{await sendOtpMail(u.email,otp,'change');}catch(error){db.prepare('DELETE FROM otps WHERE email=?').run(u.email);throw error;}
+    if(!process.env.SMTP_HOST&&process.env.DEV_RESET_LINKS!=='true')fail('Password recovery is temporarily unavailable. Please contact support.',503);const otp=generateOtp();storeOtp(u.email,otp,'change');try{await sendOtpMail(u.email,otp,'change');}catch(error){db.prepare('DELETE FROM otps WHERE email=?').run(u.email);throw error;}
     return send({message:'A 6-digit code has been sent to your registered email. It expires in 10 minutes.'});
   }
   /* ---- OTP: verify code and update password (change flow) ---- */
@@ -245,7 +248,7 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
     if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');
     verifyOtp(u.email,String(b.otp||''),'change');
     db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),u.id);
-    db.prepare('DELETE FROM sessions WHERE userId=? AND token<>?').run(u.id,hash(token));db.prepare('DELETE FROM resets WHERE userId=?').run(u.id);
+    db.prepare('DELETE FROM sessions WHERE userId=? AND token<>?').run(u.id,hash(token));db.prepare('DELETE FROM resets WHERE userId=?').run(u.id);db.prepare('DELETE FROM recoveries WHERE userId=?').run(u.id);
     audit(u,'Customer changed password via OTP');
     return send({ok:true});
   }
@@ -264,7 +267,7 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
     if(b.password===b.currentPassword)fail('Choose a different password.');
     db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),u.id);
     db.prepare('DELETE FROM sessions WHERE userId=? AND token<>?').run(u.id,hash(token));
-    db.prepare('DELETE FROM resets WHERE userId=?').run(u.id);
+    db.prepare('DELETE FROM resets WHERE userId=?').run(u.id);db.prepare('DELETE FROM recoveries WHERE userId=?').run(u.id);
     audit(u,'Changed password');return send({ok:true});
   }
   if(path==='/api/staff/tasks'&&req.method==='POST'&&u.role==='admin'){
@@ -326,7 +329,7 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
   if(staffMatch&&req.method==='POST'){if(u.role!=='admin')fail('Administrator access required.',403);const [,userType,staffId,staffAction]=staffMatch;const target=db.prepare('SELECT * FROM users WHERE id=?').get(staffId);if(!target||(userType==='staff'&&!['staff','admin'].includes(target.role)))fail('User not found.',404);
     if(staffAction==='deactivate'){if(target.id===u.id)fail('You cannot deactivate your own account.');db.prepare("UPDATE users SET status='deactivated' WHERE id=?").run(staffId);db.prepare('DELETE FROM sessions WHERE userId=?').run(staffId);audit(u,`Deactivated ${target.email}`);return send({ok:true});}
     if(staffAction==='activate'){db.prepare("UPDATE users SET status='active' WHERE id=?").run(staffId);audit(u,`Reactivated ${target.email}`);return send({ok:true});}
-    if(staffAction==='reset'){if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),staffId);db.prepare('DELETE FROM sessions WHERE userId=?').run(staffId);db.prepare('DELETE FROM resets WHERE userId=?').run(staffId);db.prepare('DELETE FROM otps WHERE email=?').run(target.email);audit(u,`Reset password for ${target.email}`);return send({ok:true});}
+    if(staffAction==='reset'){if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),staffId);db.prepare('DELETE FROM sessions WHERE userId=?').run(staffId);db.prepare('DELETE FROM resets WHERE userId=?').run(staffId);db.prepare('DELETE FROM recoveries WHERE userId=?').run(staffId);db.prepare('DELETE FROM otps WHERE email=?').run(target.email);audit(u,`Reset password for ${target.email}`);return send({ok:true});}
     if(!b.name?.trim())fail('Name is required.');if(b.email){const trimmed=b.email.trim().toLowerCase();if(trimmed!==target.email){if(db.prepare('SELECT id FROM users WHERE email=?').get(trimmed))fail('Email already registered.');}db.prepare('UPDATE users SET name=?,email=? WHERE id=?').run(b.name.trim(),trimmed,staffId);}else{db.prepare('UPDATE users SET name=? WHERE id=?').run(b.name.trim(),staffId);}audit(u,`Updated user ${target.email}`);return send({ok:true});
   }
   if(path==='/api/invoice-action'&&req.method==='POST'){
