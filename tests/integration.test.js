@@ -46,7 +46,9 @@ test('accounts, authorization, billing, payments and password recovery',async t=
   const own=(await call('/state','GET',null,customerLogin.cookie)).body;assert.equal(own.subscriptions.length,1);assert.equal(own.customers.every(c=>c.email==='one@example.com'),true);
   assert.equal((await call('/records/products','POST',{name:'Bad'},customerLogin.cookie)).status,403);
   const quote=await create('quotations',{number:'QUO-TEST',customerId:customer.id,productId:product.id,planId:plan.id,quantity:1,unitPrice:50,starts:today,ends:today,status:'Draft'});
+  const adminNotifications=await call('/notifications','GET',null,cookie);assert.equal(adminNotifications.status,200);assert.ok(adminNotifications.body.items.some(n=>n.type==='quotation-created'));const customerNotifications=await call('/notifications','GET',null,customerLogin.cookie);assert.equal(customerNotifications.status,200);assert.ok(customerNotifications.body.items.some(n=>n.type==='quotation-created-customer'));assert.equal((await call(`/notifications/${customerNotifications.body.items[0].id}/read`,'POST',{},customerLogin.cookie)).status,200);
   assert.equal((await call('/convert','POST',{id:quote.id},cookie)).status,200);
+  const convertedNotifications=await call('/notifications','GET',null,customerLogin.cookie);assert.ok(convertedNotifications.body.items.some(n=>n.type==='quotation-converted-customer'));
   assert.equal((await call('/convert','POST',{id:quote.id},cookie)).status,400);
   const staffPassword='StaffPass!42';
   assert.equal((await call('/staff','POST',{name:'Staff',email:'staff@example.com',password:staffPassword},cookie)).status,200);
