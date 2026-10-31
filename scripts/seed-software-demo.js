@@ -9,7 +9,7 @@ export function seedSoftware(db){
  const insert=(type,r)=>db.prepare('INSERT OR IGNORE INTO records VALUES(?,?,?)').run(r.id,type,JSON.stringify(r));
  const all=type=>db.prepare('SELECT body FROM records WHERE type=?').all(type).map(r=>JSON.parse(r.body));
  db.exec('BEGIN IMMEDIATE');try{
-  for(const p of softwareProducts){insert('products',{...p,id:id(p.key),currency:'INR',cost:null,notes:'Fictional demonstration product. Cost price is not supplied.',variants:p.variants||[{id:'standard',name:'Standard',extraPrice:0}],demoSet:'brightloop-v1'});
+  for(const p of softwareProducts){insert('products',{...p,id:id(p.key),currency:'INR',cost:p.cost??null,notes:p.notes||'Fictional demonstration product.',variants:p.variants||[{id:'standard',name:'Standard',extraPrice:0}],demoSet:'brightloop-v1'});
    for(const cycle of ['Monthly','Yearly']){const multiplier=cycle==='Yearly'?12:1;insert('plans',{id:id(p.key+cycle),productId:id(p.key),name:p.name+' · '+cycle,price:p.price*multiplier,currency:'INR',variantMultiplier:multiplier,cycle,minQuantity:1,allowPause:true,allowClose:true,allowRenew:true,demoSet:'brightloop-v1'});}}
   const names=shuffle(['Aarav Shah','Maya Brooks','Daniel Reed','Priya Menon','Noah Patel','Sofia Chen','Liam Wilson','Ananya Rao','Ethan Clark','Isla Morgan','Arjun Nair','Emma Davis','Lucas Martin','Zara Ali','Oliver Hayes','Meera Iyer','Aiden Thomas','Amelia Scott','Kabir Kapoor','Chloe Bennett']);
   const products=shuffle(Array.from({length:20},(_,i)=>softwareProducts[i%softwareProducts.length]));let created=0;
