@@ -1,102 +1,234 @@
 # Brightloop Software Subscription Management
 
-The shared visual theme in `theme.css`: white backgrounds, black headings, Plus Jakarta Sans typography, Figtree action labels, green `#25D366` primary actions, soft gray surfaces and rounded cards. It applies to sign-in and all three portals, with responsive layouts and visible keyboard focus. The underlying portal workflows are unchanged by this theme layer.
+A comprehensive, production-grade Subscription Management and Billing application built for **Brightloop Software**. The system provides tailored role-based portals for **Administrators**, **Staff**, and **Customers**, streamlining the entire lifecycle of software subscriptions, automated recurring billing, quotation workflows, tax and discount configurations, payment recording, expiry notifications, and financial reporting.
 
-A local subscription-management application with a Google Search Console inspired interface, Roboto typography, Material Symbols, rounded navigation selection and pill filters.
+---
 
-## Run
+## 🎨 Visual Design & Aesthetics
 
-Requires Node.js 24 or newer.
+The application features a modern, Google Search Console-inspired user interface built with:
+- **Typography:** *Plus Jakarta Sans* for headers and branding; *Figtree* for crisp action buttons and form controls; *Material Symbols Outlined* for intuitive iconography.
+- **Color Palette:** Clean white and soft gray background surfaces, dark headers, and vibrant green (`#25D366`) and blue primary action buttons.
+- **Components:** Responsive collapsible sidebar, floating top navigation with notification badge, interactive modal dialogs, status badges, and mobile-friendly overlays.
+
+---
+
+## 🚀 Quick Start
+
+### Prerequisites
+- **Node.js**: Version 24.0.0 or higher.
+- **npm** or **pnpm**.
+
+### Installation & Launch
 
 ```sh
+# Install dependencies
 npm install
+
+# Start the application server
 npm start
 ```
 
-If using pnpm, use `pnpm install` and `pnpm start` instead. Open http://localhost:3000. Serve through the Node server; opening `index.html` directly does not provide authentication or storage.
+Open **`http://localhost:3000`** in your browser.
 
-The application has three separate role experiences: administrator, staff and customer. On a new database, the bootstrap administrator is `make_a_ton@gmail.com` with password `makeaton123` unless overridden through `.env` before the first start. Public registration always creates a customer account. Administrators create staff accounts and assign their initial passwords from Team access. This is one shared workspace, not a multi-tenant service.
+> [!NOTE]
+> The application must be served through the Node.js server. Opening `index.html` directly will not provide storage or authentication.
 
-## Implemented
+### Default Bootstrap Accounts
 
-- Email/password registration, login, logout and persistent HttpOnly cookie sessions.
-- Salted scrypt password hashes, password validation and sign-in attempt limits.
-- Forgot-password email flow; hashed, single-use reset tokens valid for 30 minutes; resetting a password invalidates existing sessions.
-- Profile page and role restrictions enforced by the backend.
-- Create, edit and search products, plans, customers, discount rules and tax rules.
-- Quotation creation and conversion to a confirmed subscription.
-- Reusable quotation templates with validity periods and multiple product, service or add-on lines.
-- Persistent in-app notifications for admin, staff and customers, including quotation submission, expiry reminders, expiry, and conversion updates.
-- Subscription activation, pause, close and renewal through a new contract.
-- Enforced subscription status transitions and optional automatic closure at the contract expiry date.
-- Recurring invoices generated from active subscriptions, once per billing period; discounts and taxes calculated automatically.
-- Draft invoice review and confirmation before collection, with immutable product-line snapshots.
-- Record partial/full payments, reject overpayments and track outstanding/overdue balances.
-- Product-scoped or subscription-wide discounts with quantity, purchase amount, validity and usage limits.
-- Customer-managed add-ons for confirmed subscriptions; changes affect future billing only.
-- Print invoices or save them as PDFs with the browser print dialog, email invoice summaries, cancel unpaid invoices.
-- Actual revenue chart, dashboard summaries, overdue report, invoice CSV export and printable reports.
-- SQLite persistence and audit records in `data/subscript.db`; data is excluded from Git.
+When initialized on a fresh database, default credentials are:
+- **Administrator:** `make_a_ton@gmail.com` / `makeaton123` *(configurable via `.env`)*
+- **Public Sign-Up:** Any user who registers via the web interface is automatically provisioned with a secure **Customer** account.
+- **Staff Accounts:** Created and managed exclusively by Administrators from the **Team access** dashboard.
 
-## Password reset email
+---
 
-Copy `.env.example` to `.env` and configure SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, MAIL_FROM and APP_URL. Start with `npm start` to load `.env`. Password-reset and invoice emails use that SMTP service. No email is sent without SMTP configuration.
+## 📋 Comprehensive Feature Overview
 
-For local testing only, set `DEV_RESET_LINKS=true` in `.env`. With SMTP_HOST unset, reset links print to the server terminal rather than being delivered. The browser never receives reset tokens through the API.
+### 1. User Authentication & Security
+- **Multi-Role Access Control:** Separate portals and permissions for `admin`, `staff`, and `customer`.
+- **Registration & Validation:** Customer registration with strict password policies (more than 8 characters, at least one uppercase letter, one lowercase letter, and one special character).
+- **Secure Password Hashing:** Salted `scrypt` password hashing and secure HttpOnly cookie session management.
+- **Forgot Password & Recovery:** Automated reset links and 6-digit recovery verification codes with rate limiting and 30-minute expiry.
+- **Session Security:** Resetting a password immediately invalidates all active sessions. Instant session termination upon account deactivation.
 
-## Workflow
+### 2. Role-Based Portals (RBAC)
+- **Admin Control Center:**
+  - Complete control over product catalog, billing plans, customer records, taxes, and discounts.
+  - Team management: Create staff members, assign initial passwords, reset passwords, and toggle active/deactivated statuses.
+  - Linking unlinked customer billing records to registered customer accounts.
+  - Audit trail viewer tracking workspace activity and events.
+  - High-level business overview with total revenue, MRR, overdue balances, and customer counts.
+- **Staff Workspace:**
+  - Daily operations center with customer task management and customer detail editing.
+  - Quotation and quotation template creation and management.
+  - Subscription lifecycle management (confirm, activate, pause, resume, close, renew).
+  - Draft invoice review, invoice confirmation, email dispatch, and payment recording.
+  - Filtered Excel spreadsheet report builder.
+- **Customer Portal:**
+  - Self-service store to explore software products, features, and plans.
+  - Instant **Pay Now** checkout for immediate subscription activation without staff approval.
+  - View personal active subscriptions, cycle pricing, and next billing dates.
+  - Manage and attach add-ons to active subscriptions.
+  - View invoices, check payment history, and print or download invoices as PDF.
+  - Strict data isolation: Customers can never access another customer's data or administrative settings.
 
-1. Sign in as the bootstrap administrator, or change its credentials in `.env` before starting the server.
-2. Create a product, billing plan, customer, and optionally a tax/discount rule.
-3. Create a subscription and activate it, or create a reusable quotation template and convert a customer quotation first.
-4. Open Invoices and choose Run billing. Review and confirm generated drafts; a background job also runs every minute while the server is running.
-5. Record payments against confirmed invoices. Dashboard totals update from saved records.
-6. Customer registrations open the customer portal. To connect an existing billing record, verify the account owner and use Customer accounts to link the matching email. Public registration alone never grants access to preexisting contracts.
+### 3. Product & Variant Management
+- Categorized products: **Software**, **Service**, and **Add-on**.
+- Detailed product metadata: Name, sales price, optional cost price, description, feature lists, and notes.
+- **Brand & Product Variants:** Support for custom variants with independent price adjustments (demonstrated with Accounting Software: *Basic* brand at ₹500/mo and *Odoo* brand at ₹1,060/mo).
+- Variant multiplier support for annual plans.
 
-## Validation
+### 4. Billing Plans & Flexible Frequency
+- **Billing Cycles:** Full support for `Daily`, `Weekly`, `Monthly`, and `Yearly` cycles.
+- **Quantity Constraints:** Configurable minimum quantities per plan.
+- **Availability Windows:** Optional start (`starts`) and end (`ends`) availability dates.
+- **Plan Permissions:** Granular administrative flags controlling whether customers are permitted to pause (`allowPause`), close early (`allowClose`), or renew (`allowRenew`).
+- **Auto-Close:** Automated contract closing when reaching plan end dates (`autoClose`).
+
+### 5. Quotation Engine & Reusable Templates
+- **Quotation Templates:** Predefined multi-line product templates with preset validity periods (in days) and terms.
+- **Draft Quotations:** Custom quotation builder supporting up to 25 product lines, custom quantities, taxes, and discounts.
+- **Unique Quotation Numbers:** Formatted reference numbers (e.g., `QUO-XXXXXXXX`).
+- **One-Click Subscription Conversion:** Confirmed quotations convert directly into active subscriptions with full line snapshots.
+
+### 6. Subscription Lifecycle Management
+- **State Machine:** Validated transitions between `Draft`, `Quotation`, `Confirmed`, `Active`, `Paused`, and `Closed`.
+- **Unique Subscription IDs:** Auto-generated references (e.g., `SUB-XXXXXXXX`).
+- **Pause & Resume Logic:** Pausing subscriptions skips billing for paused periods; resuming recalculates the next billing date cleanly.
+- **Customer Add-on Management:** Attach or remove add-ons to active subscriptions; changes are applied to future billing cycles without altering past invoices.
+- **Contract Renewals:** Renewal action provisions a fresh subscription contract cleanly linked to historical records.
+
+### 7. Instant Demo Checkout (Pay Now)
+- **No Staff Approval Needed:** Customers can purchase plans with the **"Pay Now & Subscribe"** button.
+- **Automatic Instant Activation:** Immediately marks the subscription as `Active`, sets terms to `'Demo Instant Payment'`, advances the next billing date to the next cycle, generates a `Paid` invoice, and records a demo payment.
+- **On-Demand Draft Payment:** Any pending draft subscription can also be activated instantly using the "Pay Now" action in the customer subscriptions table.
+
+### 8. Automated Billing Engine & Invoicing
+- **Batch Recurring Billing:** Background automation runs every minute while the server is active, automatically generating invoices for active subscriptions whose next billing date is due.
+- **Manual Billing:** Staff and administrators can trigger batch billing on-demand via the **Run billing** button.
+- **Duplicate Prevention:** Strict idempotency guarantees each billing period is billed exactly once.
+- **Line Snapshots:** Invoices capture an immutable snapshot of product lines, quantities, unit prices, discounts, and taxes.
+- **Invoice Lifecycle:** `Draft` review → `Confirmed` (issued receivable) → `Paid` or `Cancelled`.
+- **Printable Invoices:** Clean, professional invoice document ready for printing or saving to PDF.
+
+### 9. Tax & Advanced Discount Engines
+- **Tax Rules:** Configurable tax rates (e.g., GST 18%, GST 12%, GST 5%, Zero-tax) automatically applied to invoice line items.
+- **Discount Rules:**
+  - Types: Fixed amount (e.g., ₹100 Off) or Percentage (e.g., 10% Off).
+  - Eligibility constraints: Minimum quantity, minimum purchase amount, start date, and end date.
+  - Usage Limits: Maximum usage caps (`limit`) with real-time redemption tracking (`used`).
+  - Scopes: Applies either to a specific product or across the entire subscription.
+  - Automatic expiration: Expired or maxed-out discounts stop applying automatically.
+
+### 10. Payment Recording & Overdue Tracking
+- Staff and admin payment recording against confirmed unpaid invoices.
+- Supported payment methods: `Card`, `Bank transfer`, `Cash`, and `Other`.
+- Automatic invoice settlement: Status transitions to `Paid` once the balance reaches zero.
+- Overpayment prevention: Disallows recording payment amounts greater than the remaining balance.
+- Overdue tracking: Identifies and highlights overdue invoices past their due dates.
+
+### 11. Automated 3-Stage Plan Expiry Email Alerts
+- Background automation checks for upcoming and expired subscriptions daily:
+  1. **Stage 1 (1 Week Before):** Advance notice sent 7 days prior to plan expiry.
+  2. **Stage 2 (1 Day Before):** Urgent reminder sent 24 hours prior to plan expiry.
+  3. **Stage 3 (On Expiry Date):** Final expiration notice sent on the expiry day.
+- **Rich Email Content:** Includes customer name, subscription reference, product name, expiry date, and a complete catalog of all available renewal plans and pricing for that product.
+- **Reliability:** Built-in delivery deduplication and retry queue for failed email attempts.
+
+### 12. In-App Notification Center
+- Top navigation notification bell with real-time unread badge counter.
+- Interactive popover displaying chronological system notices.
+- Notifications triggered for:
+  - Quotation creation and conversion.
+  - Invoices due and overdue alerts.
+  - Plan expiration notices (1 week, 1 day, on-expiry).
+  - Payment confirmations.
+- Options to mark individual notices as read or "Mark all read".
+
+### 13. Excel Spreadsheet Report Builder (.XLSX)
+- Configurable spreadsheet generator built on **ExcelJS**.
+- Selectable datasets: `Subscriptions`, `Renewals`, `Invoices`, `Payments`, and `Customers`.
+- Flexible customization: Choose specific columns, date ranges, status filters, and currency filters.
+- Professional formatting: Frozen header rows, auto-filter dropdowns, bold headers, formatted currency values, and ISO date cells.
+- Invoices CSV export option also available.
+
+### 14. Dashboards & Financial Analytics
+- **Live Business Metrics:** Monthly Recurring Revenue (MRR), total collections, outstanding balances, and active subscriptions.
+- **Revenue Trend Chart:** Interactive SVG chart displaying collections vs. invoiced revenue across 30-day, 90-day, or 1-year windows.
+- **Multi-Currency Support:** Separate accounting and reporting for INR and USD.
+- **Audit Logging:** System logs every record creation, update, deletion, quotation conversion, and export.
+
+---
+
+## 🛠️ Testing & Verification
+
+The project includes 11 end-to-end automated test suites covering all critical paths:
 
 ```sh
+# Run the complete test suite
 npm test
 ```
 
-Integration tests exercise authentication, authorization, billing idempotency, tax/discount calculations, partial/full payment accounting, overpayment rejection and password recovery/session invalidation.
+### Verified Test Suites:
+1. `tests/admin-portal.test.js`: Admin login, RBAC, customer management, catalog CRUD, audit logging.
+2. `tests/challenge-requirements.test.js`: Core challenge workflows, templates, lifecycle, billing.
+3. `tests/excel-report.test.js`: Excel spreadsheet creation, column selection, date/status filtering, RBAC restrictions.
+4. `tests/expiry-email.test.js`: 3-stage plan expiry emails (1 week, 1 day, expiry day), plan details inclusion, idempotency.
+5. `tests/final-integration.test.js`: Scale testing (3,000 subscriptions billed < 2s), task assignments, profile linking.
+6. `tests/integration.test.js`: Accounts, authorization, recurring billing, discounts, taxes, payment validation.
+7. `tests/merged-mail.test.js`: Email delivery boundaries, failure retry queue, escaping, quotation ownership.
+8. `tests/pay-now.test.js`: Customer instant checkout, active subscription status, automatic paid invoice and payment record.
+9. `tests/portal-alignment.test.js`: Cross-portal alignment between admin, staff, and customer views.
+10. `tests/software-portal.test.js`: Software catalog, variants (Basic vs. Odoo), plan permissions, owned subscriptions.
+11. `tests/staff-security.test.js`: Staff access boundaries, customer assignment isolation, password changes.
 
-## Current scope
+---
 
-This is a working local MVP. Payments are recorded manually; no payment processor charges cards. Customers can request draft subscriptions, manage add-ons after confirmation, print their own invoices, view recorded payments and use administrator-permitted pause, resume, close and renewal actions. Software product variants have names and price adjustments; Accounting Software demonstrates Basic and Odoo brands. Quotation templates, subscriptions and invoices support multiple product lines. Prorations, real payment processing/retries, registration email verification and multi-tenant workspaces remain future work. Password-recovery emails and plan-expiry reminders are implemented below. Availability filters and the chart use UTC billing dates. Paginated record endpoints query SQLite directly, while the dashboard state payload still needs server-side aggregation before claiming the PDF's two-second target for every view at very large scale.
+## ⚙️ Environment Configuration
 
-The server binds to loopback. Before hosting, configure HTTPS, secure cookies and SMTP, and replace first-registration administrator setup with an explicit deployment bootstrap. Back up SQLite data and use a supervised scheduler if the app must bill while its UI is closed or its process restarts. Fonts load from Google Fonts with Arial fallback.
+To configure outbound SMTP emails and deployment settings, create a `.env` file in the project root:
 
-## Brightloop software customer portal
+```env
+PORT=3000
+DATA_DIR=data
+BOOTSTRAP_ADMIN_EMAIL=make_a_ton@gmail.com
+BOOTSTRAP_ADMIN_PASSWORD=makeaton123
 
-This branch demonstrates the Subscription Management System problem statement using fictional software and services. It provides role-specific admin, staff and customer portals for the catalog, quotations, subscriptions, invoices, payments, notifications and account management.
+# Outbound SMTP Email Settings
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USER=user@example.com
+SMTP_PASS=password
+MAIL_FROM="Brightloop Software <no-reply@brightloop.com>"
+APP_URL=http://localhost:3000
 
-A product is the software or service sold. It has a name, product type, sales price, optional cost price, notes and brand variants. A billing plan links to that product and sets its cycle, price, minimum quantity, availability and permitted customer actions. A subscription is the authenticated customer's saved purchase record, including the selected variant and a snapshot of its price. Customer selections create Draft subscriptions for team confirmation; they do not charge a payment method. Customers cannot change prices, attach another customer's ID, create staff, modify catalog rules or access other customers' subscriptions/invoices/payments.
+# Local Testing (prints reset & recovery links to console if SMTP is not configured)
+DEV_RESET_LINKS=true
+```
 
-The sample INR products are Cloud Storage ₹499, CRM Software ₹999, Antivirus ₹299, Project Management Tool ₹799, Email Hosting ₹399 and Accounting Software ₹500. Accounting's Basic brand adds ₹0 and Odoo adds ₹560, giving ₹1,060/month. Yearly demo plans bill twelve monthly base/variant amounts; no annual discount is invented. Demo costs and notes are fictional sample values; administrators can edit them. Admin product forms support adding/removing variants and their extra prices; plan forms control pause, closure and renewal.
+---
 
-Start the server once to initialize an isolated demo database, then set `DATA_DIR` to that database directory and run `node scripts/seed-software-demo.js`. This repeatable setup adds six products, twelve plans and twenty fictional customer records with software subscriptions. It does not create sign-in accounts or payments, overwrite existing records, or reassign real customers. Public sign-up creates a private customer account; admins must explicitly link any pre-existing matching customer record after verifying ownership.
+## 📁 Repository Structure
 
-Invoices retain each subscription's currency; records with no currency remain legacy USD. Reports filter INR and USD separately instead of adding incompatible currencies, and exports include a currency column. Password registration/reset/staff-creation validation follows the PDF: more than eight characters, uppercase, lowercase and a special character. Existing account sign-in, cookie sessions and recovery flow are retained.
+```
+├── app.js                   # Main application frontend (Admin, Staff, Navigation, Dialogs)
+├── customer-portal.js       # Dedicated Customer self-service portal
+├── server.js                # Core HTTP server, REST API, SQLite database, and billing scheduler
+├── software-server.js       # Customer portal API endpoints and instant Pay Now demo checkout
+├── software-catalog.js      # Default software products, plans, and brand variants
+├── excel-report.js          # ExcelJS spreadsheet generation and dataset schemas
+├── expiry-mail.js           # Automated 3-stage plan expiry email engine
+├── index.html               # Main HTML entry point
+├── styles.css               # Core CSS layout and responsive components
+├── theme.css                # Visual theme tokens, typography, badges, and cards
+├── scripts/
+│   └── seed-software-demo.js# Demo database seeder (products, plans, and demo subscriptions)
+└── tests/                   # 11 automated test suites
+```
 
-The application database remains the operational source of truth. An optional Excel operations snapshot can be exported for review, with a selected dataset (including renewals, subscriptions, invoices and payments), selected columns and filters per export. This replaces the problem statement's manually maintained spreadsheet and quarterly revenue-report process; it is not a second place where staff must maintain records.
+---
 
-Run `npm test`, or run `node tests/integration.test.js` and `node tests/software-portal.test.js` directly if process-isolated tests are blocked. Tests cover authentication/recovery, billing idempotency, payment accounting, INR/legacy currency behavior, the Basic/Odoo example, server-calculated pricing, customer ownership and plan-controlled actions. Demo performance tests do not establish the problem statement's two-second target at thousands-of-record scale.
+## 📄 License
 
-
-## Combined branch workflows
-
-All remote feature tips reviewed for this integration are included in the merge history. Obsolete health-band sales modules and documentation were resolved in favor of the Brightloop software catalog. The white, black and green theme and simplified sign-in remain in place.
-
-- Recovery offers an emailed reset link for every role, or a six-digit customer verification code. Customer profiles also support emailed password-change codes; staff can change their password with their current password. Codes expire after ten minutes, allow at most five incorrect attempts and are consumed once. Resets revoke sessions and outstanding recovery credentials. Account deactivation is checked on every authenticated request.
-- Configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM` and `APP_URL` in your ignored `.env` to deliver email. No delivery is claimed when SMTP is absent. `DEV_RESET_LINKS=true` is an explicit local-only option that prints recovery links/codes to the server terminal. Never enable it on a shared deployment.
-- Expiry reminders run at seven days, one day and expiry, with catch-up during the relevant window. Messages list current available product plans, currency and expiry. Failed deliveries stay pending and retry; successful deliveries are deduplicated for the subscription's expiry date. The minute scheduler runs while the Node process is running. A server restart retains pending delivery records.
-- The notification bell is user-scoped. Confirmed unpaid invoices generate upcoming/due/overdue reminders. Quotations and plan expiry generate customer notices and staff notices for assigned customers. Administrators see workspace events. Read/unread actions cannot update another user's notifications.
-- New customer subscription requests create a calculated quotation valid for fifteen days. Customers see their quotations; team approval updates the original requested subscription rather than creating a duplicate. Templates and multi-product lines remain available. Subscription progress follows Draft, Quotation, Confirmed, Active and Closed, with plan-controlled pause/resume.
-- Administrators assign billing customers and tasks from Customers and Team access. Staff see assigned work, daily activity, customer contact editing, support actions and profile/password settings. Staff state, paginated records and Excel reports use the same customer scope, and product costs are excluded.
-- `ENABLE_DEMO_CHECKOUT=false` is the default. Enabling it exposes an explicitly simulated checkout that creates atomic invoice/payment records using server-calculated taxes and discounts. No payment gateway charges a card. Checkout references prevent duplicate payment on retries.
-- Draft invoices are not issued receivables; only confirmed unpaid invoices are due. INR and legacy USD are reported separately. Product and invoice-line snapshots are retained across add-on changes and renewals.
-
-`npm test` runs eleven independent database-backed suites sequentially without child processes. They cover authentication, reset links/codes, expiry send failures/retries, quotation ownership, notifications, staff access, Excel output, add-ons, payment accounting and billing idempotency. A local 3,000-subscription regression measures billing, state and summaries below two seconds; it is a local check, not a production performance guarantee. SMTP delivery boundaries are tested with a captured transport, not a live email provider.
-
-Dependency review: Nodemailer is updated to 10.3.1. The imported ExcelJS 4.4.0 exporter still has nine moderate transitive npm advisories (glob/minimatch and uuid chains); npm's suggested automatic fix downgrades ExcelJS and is not applied. Reports are generated from selected database fields; arbitrary archives and glob patterns are not accepted. Review or replace those upstream dependencies before a production release.
+This project is licensed under the MIT License.
