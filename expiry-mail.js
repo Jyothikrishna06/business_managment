@@ -19,7 +19,7 @@ export function createExpiryMailer({db,all,uid,notify,notifyRoles,audit}){
   const when=daysRemaining>1?`expires in ${daysRemaining} days`:daysRemaining===1?'expires tomorrow':daysRemaining===0?'expires today':`expired on ${subscription.ends}`;
   const title=`Your ${productName} subscription ${when}`,message=`${subscription.number} ${when}. Expiry date: ${subscription.ends}.`;
   notify(customer.userId,title,message,`subscription-expiry-${stage}`,reference);
-  notifyRoles('Subscription expiry reminder',`${customer.name}: ${message}`,`subscription-expiry-${stage}-staff`,reference);
+  notifyRoles('Subscription expiry reminder',`${customer.name}: ${message}`,`subscription-expiry-${stage}-staff`,reference,subscription.customerId);
   const plans=all('plans').filter(p=>p.productId===subscription.productId&&(!p.starts||p.starts<=today)&&(!p.ends||p.ends>=today)&&p.price!==null&&p.price!==undefined&&Number.isFinite(Number(p.price)));
   const options=plans.map(p=>`${p.name}: ${fmt(p.price,p.currency||currency)} / ${p.cycle}, minimum ${p.minQuantity||1}`).join('\n')||'Contact Brightloop for current renewal options.';
   const appUrl=process.env.APP_URL||'http://localhost:3000';
