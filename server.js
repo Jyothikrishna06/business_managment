@@ -13,12 +13,19 @@ const types = ['products','plans','customers','quotations','subscriptions','invo
 const hash = v => createHash('sha256').update(v).digest('hex');
 const uid = () => randomBytes(12).toString('hex');
 const passwordHash = password => { const salt = uid(); return `${salt}:${scryptSync(password,salt,64).toString('hex')}`; };
-const validPassword = p => typeof p === 'string' && p.length > 8 && p.length <= 128 && /[A-Z]/.test(p) && /[a-z]/.test(p) && /[^a-zA-Z0-9]/.test(p);
+const validPassword = p => typeof p === 'string' && p.length >= 8 && p.length <= 128 && /[A-Za-z]/.test(p) && /\d/.test(p);
 const publicUser = u => ({ id:u.id,name:u.name,email:u.email,role:u.role });
 const all = type => db.prepare('SELECT body FROM records WHERE type=?').all(type).map(r=>JSON.parse(r.body));
 const put = (type,r) => { db.prepare('INSERT OR REPLACE INTO records VALUES(?,?,?)').run(r.id,type,JSON.stringify(r)); return r; };
 function fail(message,code=400){ throw Object.assign(new Error(message),{code}); }
 function audit(user,action){ db.prepare('INSERT INTO audit(time,userId,action) VALUES(?,?,?)').run(new Date().toISOString(),user?.id||'system',action); }
+function ensureBootstrapAdmin(){
+  const email=(process.env.BOOTSTRAP_ADMIN_EMAIL||'make_a_ton@gmail.com').trim().toLowerCase();
+  const password=process.env.BOOTSTRAP_ADMIN_PASSWORD||'makeaton123';
+  const existing=db.prepare('SELECT id FROM users WHERE email=?').get(email);
+  if(!existing) db.prepare('INSERT INTO users VALUES(?,?,?,?,?)').run(uid(),'Make A Ton Admin',email,passwordHash(password),'admin');
+}
+ensureBootstrapAdmin();
 function calculate(s,date){
   const product=all('products').find(p=>p.id===s.productId); const quantity=Number(s.quantity); const subtotal=Number(s.unitPrice ?? product?.price ?? 0)*quantity;
   const discount=all('discounts').find(d=>d.id===s.discountId);
@@ -79,9 +86,9 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
   if(req.method!=='GET' && req.headers.origin && req.headers.origin!==`${req.headers['x-forwarded-proto']||'http'}://${req.headers.host}`)fail('Invalid request origin.',403);
   const b=req.method==='GET'?{}:await body(req);const email=String(b.email||'').trim().toLowerCase();
   if(path==='/api/auth/register'&&req.method==='POST'){
-    throttle(req.socket.remoteAddress);if(!b.name?.trim()||!/^\S+@\S+\.\S+$/.test(email))fail('Enter your name and a valid email.');if(!validPassword(b.password))fail('Use at least 9 characters, uppercase, lowercase and a special character.');
+    throttle(req.socket.remoteAddress);if(!b.name?.trim()||!/^\S+@\S+\.\S+$/.test(email))fail('Enter your name and a valid email.');if(!validPassword(b.password))fail('Use at least 8 characters with a letter and a number.');
     if(db.prepare('SELECT id FROM users WHERE email=?').get(email))fail('An account already exists with this email.');
-    const role=db.prepare('SELECT count(*) AS n FROM users').get().n===0?'admin':'customer';const u={id:uid(),name:b.name.trim(),email,password:passwordHash(b.password),role};db.prepare('INSERT INTO users VALUES(?,?,?,?,?)').run(u.id,u.name,email,u.password,role);if(role==='customer')put('customers',{id:uid(),name:u.name,email,userId:u.id});audit(u,'Account registered');return send({ok:true});
+    const role='customer';const u={id:uid(),name:b.name.trim(),email,password:passwordHash(b.password),role};db.prepare('INSERT INTO users VALUES(?,?,?,?,?)').run(u.id,u.name,email,u.password,role);put('customers',{id:uid(),name:u.name,email,userId:u.id});audit(u,'Customer account registered');return send({ok:true});
   }
   if(path==='/api/auth/login'&&req.method==='POST'){
     throttle(req.socket.remoteAddress);const u=db.prepare('SELECT * FROM users WHERE email=?').get(email);const [salt,saved]=(u?.password||`${uid()}:${'0'.repeat(128)}`).split(':');const computed=scryptSync(String(b.password||''),salt,64);if(!u||!timingSafeEqual(computed,Buffer.from(saved,'hex')))fail('Email or password is incorrect.',401);
@@ -94,7 +101,7 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
     return send({message:'If an account exists, a password reset link has been requested. It expires in 30 minutes.'});
   }
   if(path==='/api/auth/reset'&&req.method==='POST'){
-    throttle(req.socket.remoteAddress);if(!validPassword(b.password))fail('Use at least 9 characters, uppercase, lowercase and a special character.');const r=db.prepare('SELECT * FROM resets WHERE token=? AND expires>?').get(hash(String(b.token)),Date.now());if(!r)fail('This link is invalid or expired. Request a new reset link.');db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),r.userId);db.prepare('DELETE FROM resets WHERE userId=?').run(r.userId);db.prepare('DELETE FROM sessions WHERE userId=?').run(r.userId);return send({ok:true});
+    throttle(req.socket.remoteAddress);if(!validPassword(b.password))fail('Use at least 8 characters with a letter and a number.');const r=db.prepare('SELECT * FROM resets WHERE token=? AND expires>?').get(hash(String(b.token)),Date.now());if(!r)fail('This link is invalid or expired. Request a new reset link.');db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),r.userId);db.prepare('DELETE FROM resets WHERE userId=?').run(r.userId);db.prepare('DELETE FROM sessions WHERE userId=?').run(r.userId);return send({ok:true});
   }
   const token=(req.headers.cookie||'').split(';').map(c=>c.trim()).find(c=>c.startsWith('session='))?.slice(8);const session=token&&db.prepare('SELECT * FROM sessions WHERE token=? AND expires>?').get(hash(token),Date.now());const u=session&&db.prepare('SELECT * FROM users WHERE id=?').get(session.userId);if(!u)fail('Please sign in.',401);
   if(path==='/api/auth/me'&&req.method==='GET')return send({user:publicUser(u)});

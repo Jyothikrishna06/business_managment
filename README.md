@@ -13,7 +13,7 @@ npm start
 
 If using pnpm, use `pnpm install` and `pnpm start` instead. Open http://localhost:3000. Serve through the Node server; opening `index.html` directly does not provide authentication or storage.
 
-The first registered account is the workspace administrator. Later public registrations create customer accounts. Administrators create staff accounts from Team access. This is one shared workspace, not a multi-tenant service.
+The application has three separate role experiences: administrator, staff and customer. On a new database, the bootstrap administrator is `make_a_ton@gmail.com` with password `makeaton123` unless overridden through `.env` before the first start. Public registration always creates a customer account. Administrators create staff accounts and assign their initial passwords from Team access. This is one shared workspace, not a multi-tenant service.
 
 ## Implemented
 
@@ -38,12 +38,12 @@ For local testing only, set `DEV_RESET_LINKS=true` in `.env`. With SMTP_HOST uns
 
 ## Workflow
 
-1. Register your administrator and sign in.
+1. Sign in as the bootstrap administrator, or change its credentials in `.env` before starting the server.
 2. Create a product, billing plan, customer, and optionally a tax/discount rule.
 3. Create a subscription and activate it, or create and convert a quotation first.
 4. Open Invoices and choose Run billing. A background job also runs every minute while the server is running.
 5. Record payments against invoices. Dashboard totals update from saved records.
-6. Have the customer register, then create a customer record using their email. If their billing record already existed before registration, verify the account owner and save that customer record again to explicitly link it. Public registration alone never grants access to preexisting contracts.
+6. Customer registrations open the customer portal. To connect an existing billing record, verify the account owner and save that customer record again using the registered email. Public registration alone never grants access to preexisting contracts.
 
 ## Validation
 
