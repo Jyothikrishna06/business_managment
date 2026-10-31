@@ -1,8 +1,10 @@
+import {createSoftwarePortal} from './software-server.js';
 import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
-import { mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { extname, resolve, sep } from 'node:path';
 import nodemailer from 'nodemailer';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
@@ -13,7 +15,7 @@ const types = ['products','plans','customers','quotations','subscriptions','invo
 const hash = v => createHash('sha256').update(v).digest('hex');
 const uid = () => randomBytes(12).toString('hex');
 const passwordHash = password => { const salt = uid(); return `${salt}:${scryptSync(password,salt,64).toString('hex')}`; };
-const validPassword = p => typeof p === 'string' && p.length >= 8 && p.length <= 128 && /[A-Za-z]/.test(p) && /\d/.test(p);
+const validPassword = p => typeof p === 'string' && p.length > 8 && p.length <= 128 && /[A-Z]/.test(p) && /[a-z]/.test(p) && /[^a-zA-Z0-9]/.test(p);
 const publicUser = u => ({ id:u.id,name:u.name,email:u.email,role:u.role });
 const all = type => db.prepare('SELECT body FROM records WHERE type=?').all(type).map(r=>JSON.parse(r.body));
 const put = (type,r) => { db.prepare('INSERT OR REPLACE INTO records VALUES(?,?,?)').run(r.id,type,JSON.stringify(r)); return r; };
@@ -47,7 +49,7 @@ function bill(){
       if(!all('invoices').some(i=>i.subscriptionId===s.id&&i.billingDate===due)){
         const totals=calculate(s,due),customer=all('customers').find(c=>c.id===s.customerId),product=all('products').find(p=>p.id===s.productId);
         const dueDate=new Date(`${due}T12:00:00Z`);dueDate.setUTCDate(dueDate.getUTCDate()+Number(String(s.terms||'').match(/Net (7|15|30|60)/)?.[1]||0));
-        put('invoices',{id:uid(),number:`INV-${uid().slice(0,8).toUpperCase()}`,customerId:s.customerId,subscriptionId:s.id,billingDate:due,due:dueDate.toISOString().slice(0,10),status:totals.total===0?'Paid':'Confirmed',line:{name:product.name,quantity:s.quantity,unitPrice:s.unitPrice},customer:{name:customer.name,email:customer.email},terms:s.terms||'',...totals});count++;
+        put('invoices',{id:uid(),number:`INV-${uid().slice(0,8).toUpperCase()}`,customerId:s.customerId,subscriptionId:s.id,billingDate:due,due:dueDate.toISOString().slice(0,10),currency:s.currency||'USD',status:totals.total===0?'Paid':'Confirmed',line:{name:product.name+(s.variantName?' · '+s.variantName:''),quantity:s.quantity,unitPrice:s.unitPrice},customer:{name:customer.name,email:customer.email},terms:s.terms||'',...totals});count++;
         if(totals.discount&&s.discountId){const d=all('discounts').find(d=>d.id===s.discountId);put('discounts',{...d,used:Number(d.used||0)+1});}
       }
       due=nextDate(due,s.cycle||'Monthly',Number(s.starts.slice(8,10)));
@@ -62,6 +64,19 @@ function validate(type,r){
   if(['products','plans','customers','discounts','taxes'].includes(type)&&!String(r.name||'').trim())fail('Name is required.');
   for(const key of ['price','cost','quantity','unitPrice','value','rate','minQuantity','limit','amount'])if(r[key]!==undefined && (!Number.isFinite(Number(r[key]))||Number(r[key])<0||Number(r[key])>1e10))fail(`${key} must be a valid positive number.`);
   if(type==='customers'){if(!/^\S+@\S+\.\S+$/.test(r.email||''))fail('Enter a valid customer email.');r.email=r.email.toLowerCase().trim();}
+  if(type==='products'){
+    if(r.productType&&!['Software','Service','Add-on'].includes(r.productType))fail('Choose Software, Service or Add-on.');
+    if(r.currency&&!['INR','USD'].includes(r.currency))fail('Choose a supported currency.');
+    if(r.variants!==undefined){if(!Array.isArray(r.variants)||!r.variants.length||r.variants.length>20)fail('Add between 1 and 20 variants.');const ids=new Set();r.variants=r.variants.map(v=>{if(typeof v.name!=='string'||!v.name.trim()||v.name.length>100||!Number.isFinite(Number(v.extraPrice))||Number(v.extraPrice)<0||Number(v.extraPrice)>1e10)fail('Enter a variant name and valid extra price.');const id=String(v.id||uid());if(ids.has(id))fail('Variant IDs must be unique.');ids.add(id);return {id,name:v.name.trim(),extraPrice:Number(v.extraPrice)};});}
+  }
+  if(type==='plans'){
+    if(r.productId&&!all('products').some(p=>p.id===r.productId))fail('Choose a product.');
+    if(r.currency&&!['INR','USD'].includes(r.currency))fail('Choose a supported currency.');
+    for(const key of ['allowPause','allowClose','allowRenew'])if(r[key]!==undefined){if(r[key]==='')r[key]=false;if(![true,false,'true','false'].includes(r[key]))fail('Choose a valid plan permission.');r[key]=r[key]===true||r[key]==='true';}
+    if(r.variantMultiplier==='')r.variantMultiplier=1;
+    for(const [key,type] of [['taxId','taxes'],['discountId','discounts']])if(r[key]&&!all(type).some(t=>t.id===r[key]))fail('Choose valid tax and discount rules.');
+    if(r.variantMultiplier!==undefined&&(!Number.isFinite(Number(r.variantMultiplier))||Number(r.variantMultiplier)<0||Number(r.variantMultiplier)>366))fail('Choose a valid variant billing multiplier.');
+  }
   if(type==='plans'&&!['Daily','Weekly','Monthly','Yearly'].includes(r.cycle))fail('Choose a billing cycle.');
   if(type==='discounts'&&!['Fixed','Percentage'].includes(r.kind))fail('Choose a discount type.');
   if(type==='taxes'&&Number(r.rate)>100)fail('Tax rate cannot exceed 100%.');
@@ -80,13 +95,14 @@ function validate(type,r){
     if(type==='subscriptions'&&!['Draft','Quotation','Confirmed','Active','Paused','Closed'].includes(r.status))fail('Invalid status.');
   }
 }
+const softwarePortal=createSoftwarePortal({all,put,uid,fail,audit,nextDate});
 const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http://localhost');const path=url.pathname;const send=(data,code=200,headers={})=>{res.writeHead(code,{'Content-Type':'application/json','Cache-Control':'no-store',...headers});res.end(JSON.stringify(data));};try{
   res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('X-Frame-Options','DENY');res.setHeader('Referrer-Policy','same-origin');
-  if(!path.startsWith('/api/')){const files={'/':'index.html','/index.html':'index.html','/app.js':'app.js','/styles.css':'styles.css'};if(!files[path])return send({error:'Not found'},404);res.setHeader('Content-Type',path.endsWith('.js')?'text/javascript':path.endsWith('.css')?'text/css':'text/html');res.end(readFileSync(`${root}${files[path]}`));return;}
+  if(!path.startsWith('/api/')){const files={'/':'index.html','/index.html':'index.html','/app.js':'app.js','/customer-portal.js':'customer-portal.js','/styles.css':'styles.css'};if(files[path]){res.setHeader('Content-Type',path.endsWith('.js')?'text/javascript':path.endsWith('.css')?'text/css':'text/html');res.end(readFileSync(`${root}${files[path]}`));return;}if(path.startsWith('/assets/')){const assetRoot=resolve(root,'assets'),assetPath=resolve(root,`.${decodeURIComponent(path)}`);if(!assetPath.startsWith(`${assetRoot}${sep}`)||!existsSync(assetPath))return send({error:'Not found'},404);const mime={'.png':'image/png','.webp':'image/webp','.jpg':'image/jpeg','.jpeg':'image/jpeg'}[extname(assetPath).toLowerCase()];if(!mime)return send({error:'Unsupported asset type'},415);res.setHeader('Content-Type',mime);res.setHeader('Cache-Control','public, max-age=3600');res.end(readFileSync(assetPath));return;}return send({error:'Not found'},404);}
   if(req.method!=='GET' && req.headers.origin && req.headers.origin!==`${req.headers['x-forwarded-proto']||'http'}://${req.headers.host}`)fail('Invalid request origin.',403);
   const b=req.method==='GET'?{}:await body(req);const email=String(b.email||'').trim().toLowerCase();
   if(path==='/api/auth/register'&&req.method==='POST'){
-    throttle(req.socket.remoteAddress);if(!b.name?.trim()||!/^\S+@\S+\.\S+$/.test(email))fail('Enter your name and a valid email.');if(!validPassword(b.password))fail('Use at least 8 characters with a letter and a number.');
+    throttle(req.socket.remoteAddress);if(!b.name?.trim()||!/^\S+@\S+\.\S+$/.test(email))fail('Enter your name and a valid email.');if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');
     if(db.prepare('SELECT id FROM users WHERE email=?').get(email))fail('An account already exists with this email.');
     const role='customer';const u={id:uid(),name:b.name.trim(),email,password:passwordHash(b.password),role};db.prepare('INSERT INTO users VALUES(?,?,?,?,?)').run(u.id,u.name,email,u.password,role);put('customers',{id:uid(),name:u.name,email,userId:u.id});audit(u,'Customer account registered');return send({ok:true});
   }
@@ -101,13 +117,14 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
     return send({message:'If an account exists, a password reset link has been requested. It expires in 30 minutes.'});
   }
   if(path==='/api/auth/reset'&&req.method==='POST'){
-    throttle(req.socket.remoteAddress);if(!validPassword(b.password))fail('Use at least 8 characters with a letter and a number.');const r=db.prepare('SELECT * FROM resets WHERE token=? AND expires>?').get(hash(String(b.token)),Date.now());if(!r)fail('This link is invalid or expired. Request a new reset link.');db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),r.userId);db.prepare('DELETE FROM resets WHERE userId=?').run(r.userId);db.prepare('DELETE FROM sessions WHERE userId=?').run(r.userId);return send({ok:true});
+    throttle(req.socket.remoteAddress);if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');const r=db.prepare('SELECT * FROM resets WHERE token=? AND expires>?').get(hash(String(b.token)),Date.now());if(!r)fail('This link is invalid or expired. Request a new reset link.');db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),r.userId);db.prepare('DELETE FROM resets WHERE userId=?').run(r.userId);db.prepare('DELETE FROM sessions WHERE userId=?').run(r.userId);return send({ok:true});
   }
   const token=(req.headers.cookie||'').split(';').map(c=>c.trim()).find(c=>c.startsWith('session='))?.slice(8);const session=token&&db.prepare('SELECT * FROM sessions WHERE token=? AND expires>?').get(hash(token),Date.now());const u=session&&db.prepare('SELECT * FROM users WHERE id=?').get(session.userId);if(!u)fail('Please sign in.',401);
   if(path==='/api/auth/me'&&req.method==='GET')return send({user:publicUser(u)});
   if(path==='/api/auth/logout'&&req.method==='POST'){db.prepare('DELETE FROM sessions WHERE token=?').run(hash(token));return send({ok:true},200,{'Set-Cookie':'session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'});}
   if(path==='/api/profile'&&req.method==='POST'){if(!b.name?.trim())fail('Name is required.');db.prepare('UPDATE users SET name=? WHERE id=?').run(b.name.trim(),u.id);return send({user:{...publicUser(u),name:b.name.trim()}});}
-  if(path==='/api/state'&&req.method==='GET'){const data=Object.fromEntries(types.map(t=>[t,all(t)]));if(u.role==='customer'){const ids=data.customers.filter(c=>c.userId===u.id).map(c=>c.id);for(const t of ['subscriptions','quotations','invoices'])data[t]=data[t].filter(r=>ids.includes(r.customerId));const invoices=data.invoices.map(i=>i.id);data.payments=data.payments.filter(p=>invoices.includes(p.invoiceId));data.customers=data.customers.filter(c=>ids.includes(c.id));data.products=data.products.filter(p=>data.subscriptions.some(s=>s.productId===p.id)).map(({id,name,price})=>({id,name,price}));data.discounts=[];data.taxes=[];}return send(data);}
+  if(path==='/api/state'&&req.method==='GET'){const data=Object.fromEntries(types.map(t=>[t,all(t)]));if(u.role==='customer'){data.catalog=softwarePortal.catalog();const ids=data.customers.filter(c=>c.userId===u.id).map(c=>c.id);for(const t of ['subscriptions','quotations','invoices'])data[t]=data[t].filter(r=>ids.includes(r.customerId));const invoices=data.invoices.map(i=>i.id);data.payments=data.payments.filter(p=>invoices.includes(p.invoiceId));data.customers=data.customers.filter(c=>ids.includes(c.id));data.products=data.products.filter(p=>data.subscriptions.some(s=>s.productId===p.id)).map(({id,name,price,currency})=>({id,name,price,currency}));data.discounts=[];data.taxes=[];}return send(data);}
+  if(path.startsWith('/api/customer/'))return send(softwarePortal.handle(u,path,req.method,b));
   if(u.role==='customer')fail('You do not have permission to perform this action.',403);
   if(path==='/api/team'&&req.method==='GET'){if(u.role!=='admin')fail('Administrator access required.',403);return send(db.prepare('SELECT id,name,email,role FROM users WHERE role IN (\'admin\',\'staff\')').all());}
   if(path==='/api/invoice-action'&&req.method==='POST'){
@@ -134,3 +151,6 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
 }catch(e){send({error:e.code&&typeof e.code==='number'?e.message:'The request could not be completed.'},typeof e.code==='number'?e.code:500);if(!e.code)console.error(e);}});
 server.listen(Number(process.env.PORT||3000),'127.0.0.1',()=>console.log(`Subscript running at ${process.env.APP_URL||'http://localhost:3000'}`));
 const timer=setInterval(()=>{try{bill();}catch(e){console.error('Billing error',e.message);}},60000);timer.unref();
+
+server.on('close',()=>{clearInterval(timer);db.close();});
+export {server};
