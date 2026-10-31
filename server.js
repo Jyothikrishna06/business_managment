@@ -1,4 +1,5 @@
 import {createSoftwarePortal} from './software-server.js';
+import {createExcelReport,reportSchema} from './excel-report.js';
 import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
@@ -10,9 +11,9 @@ import nodemailer from 'nodemailer';
 const root = fileURLToPath(new URL('.', import.meta.url));
 mkdirSync(process.env.DATA_DIR || `${root}data`, { recursive: true });
 const db = new DatabaseSync(`${process.env.DATA_DIR || `${root}data`}/subscript.db`);
-db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT,email TEXT UNIQUE,password TEXT,role TEXT,status TEXT DEFAULT 'active'); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS resets(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS records(id TEXT PRIMARY KEY,type TEXT,body TEXT); CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,time TEXT,userId TEXT,action TEXT);`);
+db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT,email TEXT UNIQUE,password TEXT,role TEXT,status TEXT DEFAULT 'active'); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS resets(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS records(id TEXT PRIMARY KEY,type TEXT,body TEXT); CREATE INDEX IF NOT EXISTS records_type_idx ON records(type); CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,time TEXT,userId TEXT,action TEXT); CREATE TABLE IF NOT EXISTS notifications(id TEXT PRIMARY KEY,userId TEXT,title TEXT,message TEXT,type TEXT,referenceId TEXT,createdAt TEXT,readAt TEXT,UNIQUE(userId,type,referenceId)); CREATE INDEX IF NOT EXISTS notifications_user_idx ON notifications(userId,createdAt DESC); CREATE TABLE IF NOT EXISTS expiry_notices(id TEXT PRIMARY KEY,subscriptionId TEXT,stage TEXT,sentAt TEXT,UNIQUE(subscriptionId,stage));`);
 try{db.exec(`ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'`);}catch{/* column may already exist */}
-const types = ['products','plans','customers','quotations','subscriptions','invoices','payments','discounts','taxes'];
+const types = ['products','plans','customers','quotationTemplates','quotations','subscriptions','invoices','payments','discounts','taxes'];
 const hash = v => createHash('sha256').update(v).digest('hex');
 const uid = () => randomBytes(12).toString('hex');
 const passwordHash = password => { const salt = uid(); return `${salt}:${scryptSync(password,salt,64).toString('hex')}`; };
@@ -22,6 +23,11 @@ const all = type => db.prepare('SELECT body FROM records WHERE type=?').all(type
 const put = (type,r) => { db.prepare('INSERT OR REPLACE INTO records VALUES(?,?,?)').run(r.id,type,JSON.stringify(r)); return r; };
 function fail(message,code=400){ throw Object.assign(new Error(message),{code}); }
 function audit(user,action){ db.prepare('INSERT INTO audit(time,userId,action) VALUES(?,?,?)').run(new Date().toISOString(),user?.id||'system',action); }
+function notify(userId,title,message,type,referenceId=''){if(!userId)return;db.prepare('INSERT OR IGNORE INTO notifications(id,userId,title,message,type,referenceId,createdAt,readAt) VALUES(?,?,?,?,?,?,?,NULL)').run(uid(),userId,title,message,type,referenceId,new Date().toISOString());}
+function notifyRoles(title,message,type,referenceId){db.prepare("SELECT id FROM users WHERE role IN ('admin','staff') AND COALESCE(status,'active')='active'").all().forEach(({id})=>notify(id,title,message,type,referenceId));}
+function customerUserId(customerId){return all('customers').find(c=>c.id===customerId)?.userId||null;}
+function notifyQuotation(quote,event){const product=all('products').find(p=>p.id===quote.productId)?.name||'product';const customer=all('customers').find(c=>c.id===quote.customerId);const customerName=customer?.name||'Customer';if(event==='created'){notifyRoles('New quotation awaiting review',`${quote.number||'Quotation'} for ${customerName} · ${product} is ready for team review.`,'quotation-created',quote.id);notify(customer?.userId,'Quotation submitted',`${quote.number||'Quotation'} for ${product} was submitted and is awaiting confirmation.`,'quotation-created-customer',quote.id);}else if(event==='expiring'){notifyRoles('Quotation expires soon',`${quote.number||'Quotation'} for ${customerName} expires on ${quote.ends}.`,'quotation-expiring',quote.id);notify(customer?.userId,'Quotation expires soon',`${quote.number||'Quotation'} expires on ${quote.ends}. Contact Brightloop if you want to proceed.`,'quotation-expiring-customer',quote.id);}else if(event==='expired'){notifyRoles('Quotation expired',`${quote.number||'Quotation'} for ${customerName} expired on ${quote.ends}.`,'quotation-expired',quote.id);notify(customer?.userId,'Quotation expired',`${quote.number||'Quotation'} expired on ${quote.ends}. A new quotation can be requested.`,'quotation-expired-customer',quote.id);}else if(event==='converted'){notifyRoles('Quotation converted',`${quote.number||'Quotation'} for ${customerName} was converted to a subscription.`,'quotation-converted',quote.id);notify(customer?.userId,'Quotation approved',`${quote.number||'Quotation'} was approved and converted to a subscription.`,'quotation-converted-customer',quote.id);}}
+function quotationAutomation(){const today=new Date().toISOString().slice(0,10),soon=new Date(`${today}T12:00:00Z`);soon.setUTCDate(soon.getUTCDate()+3);const soonDate=soon.toISOString().slice(0,10);for(const quote of all('quotations')){if(['Draft','Quotation'].includes(quote.status)&&quote.ends&&quote.ends<today){quote.status='Expired';put('quotations',quote);notifyQuotation(quote,'expired');}else if(['Draft','Quotation'].includes(quote.status)&&quote.ends===soonDate)notifyQuotation(quote,'expiring');}}
 function ensureBootstrapAdmin(){
   const email=(process.env.BOOTSTRAP_ADMIN_EMAIL||'make_a_ton@gmail.com').trim().toLowerCase();
   const password=process.env.BOOTSTRAP_ADMIN_PASSWORD||'makeaton123';
@@ -41,41 +47,117 @@ function ensureBootstrapDefaults(){
 }
 ensureBootstrapAdmin();
 ensureBootstrapDefaults();
-function calculate(s,date){
-  const product=all('products').find(p=>p.id===s.productId); const quantity=Number(s.quantity); const subtotal=Number(s.unitPrice ?? product?.price ?? 0)*quantity;
-  const discount=all('discounts').find(d=>d.id===s.discountId);
-  let deduction=0;
-  if(discount && (!discount.starts||discount.starts<=date) && (!discount.ends||discount.ends>=date) && (!discount.limit||Number(discount.used||0)<Number(discount.limit)) && quantity>=Number(discount.minQuantity||1)) {
-    deduction=discount.kind==='Percentage'?subtotal*Number(discount.value)/100:Number(discount.value);
-  }
-  deduction=Math.min(subtotal,deduction);
-  const tax=all('taxes').find(t=>t.id===s.taxId); const taxAmount=(subtotal-deduction)*Number(tax?.rate||0)/100;
-  return {subtotal,discount:deduction,tax:taxAmount,total:Math.round((subtotal-deduction+taxAmount)*100)/100};
+const round=value=>Math.round(Number(value||0)*100)/100;
+function recordLines(record){
+  const supplied=Array.isArray(record.lines)&&record.lines.length?record.lines:[{productId:record.productId,planId:record.planId,variantId:record.variantId,variantName:record.variantName,quantity:record.quantity,unitPrice:record.unitPrice,taxId:record.taxId,discountId:record.discountId}];
+  return supplied.map(line=>({...line,productId:line.productId||record.productId,planId:line.planId||record.planId,quantity:Number(line.quantity),unitPrice:Number(line.unitPrice),taxId:line.taxId??record.taxId??'',discountId:line.discountId??record.discountId??''}));
+}
+function calculate(s,date,context={}){
+  const products=context.products||all('products'),taxes=context.taxes||all('taxes'),discounts=context.discounts||all('discounts'),lines=recordLines(s);
+  const prepared=lines.map(line=>{const product=products.find(p=>p.id===line.productId);const subtotal=round(line.unitPrice*line.quantity);return {...line,name:(product?.name||'Subscription')+(line.variantName?' · '+line.variantName:''),subtotal};});
+  const subtotal=round(prepared.reduce((sum,line)=>sum+line.subtotal,0));
+  const discount=discounts.find(d=>d.id===s.discountId);
+  const eligible=discount?.scope==='Product'&&discount.productId?prepared.filter(line=>line.productId===discount.productId):prepared;
+  const eligibleSubtotal=round(eligible.reduce((sum,line)=>sum+line.subtotal,0)),eligibleQuantity=eligible.reduce((sum,line)=>sum+line.quantity,0);
+  const applies=discount&&(!discount.starts||discount.starts<=date)&&(!discount.ends||discount.ends>=date)&&(!discount.limit||Number(discount.used||0)<Number(discount.limit))&&eligibleQuantity>=Number(discount.minQuantity||1)&&eligibleSubtotal>=Number(discount.minPurchase||0);
+  let deduction=applies?(discount.kind==='Percentage'?eligibleSubtotal*Number(discount.value)/100:Number(discount.value)):0;deduction=round(Math.min(eligibleSubtotal,deduction));
+  let remainingDiscount=deduction,eligibleRemaining=eligible.length;
+  const invoiceLines=prepared.map(line=>{const eligibleLine=eligible.includes(line);let lineDiscount=0;if(eligibleLine&&deduction){eligibleRemaining--;lineDiscount=eligibleRemaining===0?remainingDiscount:round(deduction*(line.subtotal/Math.max(eligibleSubtotal,1)));lineDiscount=Math.min(line.subtotal,remainingDiscount,lineDiscount);remainingDiscount=round(remainingDiscount-lineDiscount);}const taxRule=taxes.find(t=>t.id===line.taxId);const tax=round((line.subtotal-lineDiscount)*Number(taxRule?.rate||0)/100);return {...line,discount:lineDiscount,tax,total:round(line.subtotal-lineDiscount+tax)};});
+  const tax=round(invoiceLines.reduce((sum,line)=>sum+line.tax,0));
+  return {subtotal,discount:deduction,tax,total:round(subtotal-deduction+tax),lines:invoiceLines};
 }
 function nextDate(date,cycle,anchor){ const d=new Date(`${date}T12:00:00Z`); const day=d.getUTCDate(); if(cycle==='Daily')d.setUTCDate(day+1);else if(cycle==='Weekly')d.setUTCDate(day+7);else {d.setUTCDate(1);if(cycle==='Yearly')d.setUTCFullYear(d.getUTCFullYear()+1);else d.setUTCMonth(d.getUTCMonth()+1);const last=new Date(Date.UTC(d.getUTCFullYear(),d.getUTCMonth()+1,0)).getUTCDate();d.setUTCDate(Math.min(anchor||day,last));}return d.toISOString().slice(0,10); }
 function bill(){
-  const today=new Date().toISOString().slice(0,10);let count=0;db.exec('BEGIN IMMEDIATE');
-  try{for(const s of all('subscriptions')){
-    if(s.status!=='Active')continue;let due=s.nextBilling||s.starts;let n=0;
+  subscriptionAutomation();
+  const today=new Date().toISOString().slice(0,10),subscriptions=all('subscriptions'),plans=new Map(all('plans').map(item=>[item.id,item])),customers=new Map(all('customers').map(item=>[item.id,item])),invoices=all('invoices'),invoicePeriods=new Set(invoices.map(item=>`${item.subscriptionId}:${item.billingDate}`)),context={products:all('products'),taxes:all('taxes'),discounts:all('discounts')};let count=0;db.exec('BEGIN IMMEDIATE');
+  try{for(const s of subscriptions){
+    if(s.status!=='Active')continue;const plan=plans.get(s.planId);let due=s.nextBilling||s.starts;let n=0;
     while(due&&due<=today&&n++<120){
-      if(s.ends&&due>s.ends){s.status='Closed';break;}
-      if(!all('invoices').some(i=>i.subscriptionId===s.id&&i.billingDate===due)){
-        const totals=calculate(s,due),customer=all('customers').find(c=>c.id===s.customerId),product=all('products').find(p=>p.id===s.productId);
+      if(s.ends&&due>s.ends){if(plan?.autoClose===true)s.status='Closed';break;}
+      if(!invoicePeriods.has(`${s.id}:${due}`)){
+        const totals=calculate(s,due,context),customer=customers.get(s.customerId);
         const dueDate=new Date(`${due}T12:00:00Z`);dueDate.setUTCDate(dueDate.getUTCDate()+Number(String(s.terms||'').match(/Net (7|15|30|60)/)?.[1]||0));
-        put('invoices',{id:uid(),number:`INV-${uid().slice(0,8).toUpperCase()}`,customerId:s.customerId,subscriptionId:s.id,billingDate:due,due:dueDate.toISOString().slice(0,10),currency:s.currency||'INR',status:totals.total===0?'Paid':'Confirmed',line:{name:(product?.name||'Subscription')+(s.variantName?' · '+s.variantName:''),quantity:s.quantity,unitPrice:s.unitPrice},customer:{name:customer?.name||'Customer',email:customer?.email||''},terms:s.terms||'',...totals});count++;
-        if(totals.discount&&s.discountId){const d=all('discounts').find(d=>d.id===s.discountId);put('discounts',{...d,used:Number(d.used||0)+1});}
+        put('invoices',{id:uid(),number:`INV-${uid().slice(0,8).toUpperCase()}`,customerId:s.customerId,subscriptionId:s.id,billingDate:due,due:dueDate.toISOString().slice(0,10),currency:s.currency||'INR',status:totals.total===0?'Paid':'Draft',line:totals.lines[0],lines:totals.lines,customer:{name:customer?.name||'Customer',email:customer?.email||''},terms:s.terms||'',...totals});invoicePeriods.add(`${s.id}:${due}`);count++;
+        if(totals.discount&&s.discountId){const d=context.discounts.find(item=>item.id===s.discountId),updated={...d,used:Number(d.used||0)+1};put('discounts',updated);context.discounts=context.discounts.map(item=>item.id===updated.id?updated:item);}
       }
       due=nextDate(due,s.cycle||'Monthly',Number(s.starts.slice(8,10)));
     }
-    if(s.ends&&s.ends<today&&due>s.ends)s.status='Closed';s.nextBilling=due;put('subscriptions',s);
+    if(plan?.autoClose===true&&s.ends&&s.ends<today&&due>s.ends)s.status='Closed';s.nextBilling=due;put('subscriptions',s);
   }db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}return count;
+}
+async function sendExpiryEmail(subscription,stage,daysRemaining){
+  const existing=db.prepare('SELECT id FROM expiry_notices WHERE subscriptionId=? AND stage=?').get(subscription.id,stage);
+  if(existing)return;
+  const customer=all('customers').find(c=>c.id===subscription.customerId);
+  if(!customer?.email)return;
+  db.prepare('INSERT OR IGNORE INTO expiry_notices VALUES(?,?,?,?)').run(uid(),subscription.id,stage,new Date().toISOString());
+  const product=all('products').find(p=>p.id===subscription.productId)||{name:'Product'};
+  const currentPlan=all('plans').find(p=>p.id===subscription.planId)||{};
+  const availablePlans=all('plans').filter(p=>p.productId===subscription.productId);
+  const currency=subscription.currency||product.currency||'INR';
+  const fmt=val=>new Intl.NumberFormat('en-IN',{style:'currency',currency,maximumFractionDigits:2}).format(Number(val||0));
+  const appUrl=process.env.APP_URL||'http://localhost:3000';
+  let subject='',headline='',desc='';
+  if(stage==='week_before'){
+    subject=`Notice: Your ${product.name} subscription expires in 7 days`;
+    headline='Subscription Expiry Notice — 7 Days Remaining';
+    desc=`Your subscription (${subscription.number}) for ${product.name} will expire on ${subscription.ends} (in 7 days).`;
+  }else if(stage==='day_before'){
+    subject=`Urgent: Your ${product.name} subscription expires tomorrow`;
+    headline='Urgent Notice — 1 Day Remaining';
+    desc=`Your subscription (${subscription.number}) for ${product.name} will expire tomorrow on ${subscription.ends}.`;
+  }else{
+    subject=`Notice: Your ${product.name} subscription expires today`;
+    headline='Subscription Expiration Notice — Expires Today';
+    desc=`Your subscription (${subscription.number}) for ${product.name} reaches its expiration date today (${subscription.ends}).`;
+  }
+  const plansText=availablePlans.length
+    ? availablePlans.map(p=>`  • ${p.name}: ${fmt(p.price)} / ${p.cycle||'Monthly'}${p.minQuantity>1?` (Min qty: ${p.minQuantity})`:''}`).join('\n')
+    : '  • Contact support for renewal plan options.';
+  const plansHtml=availablePlans.length
+    ? availablePlans.map(p=>`<tr style="border-bottom:1px solid #e0e0e0"><td style="padding:10px 14px;font-weight:600;color:#192536">${p.name}</td><td style="padding:10px 14px;color:#1967d2;font-weight:600">${fmt(p.price)}</td><td style="padding:10px 14px;color:#5f6368">${p.cycle||'Monthly'}</td><td style="padding:10px 14px;color:#5f6368">${p.minQuantity||1} unit(s)</td></tr>`).join('')
+    : '<tr><td colspan="4" style="padding:12px;color:#777">Contact support for renewal plan options.</td></tr>';
+  const textBody=`Hello ${customer.name||'Customer'},\n\n${headline}\n${desc}\n\nSUBSCRIPTION DETAILS:\n• Subscription Number: ${subscription.number}\n• Product: ${product.name}${subscription.variantName?` (${subscription.variantName})`:''}\n• Current Plan: ${currentPlan.name||'Standard'} (${subscription.cycle||'Monthly'})\n• Expiry Date: ${subscription.ends}\n• Quantity & Rate: ${subscription.quantity} × ${fmt(subscription.unitPrice)}\n\nAVAILABLE PLANS FOR ${product.name.toUpperCase()}:\n${plansText}\n\nTo renew or change your plan, sign in to your Brightloop portal:\n${appUrl}\n\nThank you,\nBrightloop Software Support Team`;
+  const htmlBody=`<div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px;color:#202124;background:#fff;border:1px solid #e0e0e0;border-radius:12px"><div style="border-bottom:2px solid #1967d2;padding-bottom:14px;margin-bottom:20px"><h2 style="color:#1967d2;margin:0;font-size:22px">Brightloop Software</h2><p style="margin:4px 0 0;color:#5f6368;font-size:13px">Subscription & Plan Expiry Notification</p></div><div style="background:#f1f5fd;border-left:4px solid #1967d2;padding:14px 18px;margin-bottom:22px;border-radius:4px"><strong style="color:#174ea6;font-size:16px;display:block;margin-bottom:6px">${headline}</strong><p style="margin:0;font-size:14px;color:#3c4043;line-height:1.5">${desc}</p></div><h3 style="font-size:15px;color:#192536;margin-bottom:10px">Subscription Summary</h3><table style="width:100%;border-collapse:collapse;margin-bottom:24px;font-size:13px"><tr style="background:#fafafa"><td style="padding:8px 12px;font-weight:bold;width:40%">Subscription Number:</td><td style="padding:8px 12px">${subscription.number}</td></tr><tr><td style="padding:8px 12px;font-weight:bold">Product:</td><td style="padding:8px 12px">${product.name}${subscription.variantName?` · ${subscription.variantName}`:''}</td></tr><tr style="background:#fafafa"><td style="padding:8px 12px;font-weight:bold">Current Plan:</td><td style="padding:8px 12px">${currentPlan.name||'Standard'} (${subscription.cycle||'Monthly'})</td></tr><tr><td style="padding:8px 12px;font-weight:bold">Expiry Date:</td><td style="padding:8px 12px;color:#b3261e;font-weight:bold">${subscription.ends}</td></tr><tr style="background:#fafafa"><td style="padding:8px 12px;font-weight:bold">Quantity & Rate:</td><td style="padding:8px 12px">${subscription.quantity} × ${fmt(subscription.unitPrice)}</td></tr></table><h3 style="font-size:15px;color:#192536;margin-bottom:10px">Available Plans for ${product.name}</h3><table style="width:100%;border-collapse:collapse;margin-bottom:24px;font-size:13px"><thead><tr style="background:#e8f0fe;color:#174ea6;text-align:left"><th style="padding:10px 14px">Plan</th><th style="padding:10px 14px">Price</th><th style="padding:10px 14px">Cycle</th><th style="padding:10px 14px">Min Qty</th></tr></thead><tbody>${plansHtml}</tbody></table><div style="text-align:center;margin:30px 0 20px"><a href="${appUrl}" style="background:#1967d2;color:#fff;text-decoration:none;padding:12px 28px;border-radius:24px;font-weight:bold;font-size:14px;display:inline-block">Sign In & Renew Plan</a></div><div style="border-top:1px solid #e0e0e0;padding-top:16px;margin-top:24px;font-size:12px;color:#757575"><p style="margin:0 0 6px">Questions? Reply to this email or sign in to your Brightloop customer portal.</p><p style="margin:0">Brightloop Software Inc. · Automated Subscription Management</p></div></div>`;
+  notify(customerUserId(subscription.customerId),headline,desc,`subscription-expiry-${stage}`,subscription.id);
+  notifyRoles(`Subscription Expiry Notice (${stage.replace('_',' ')})`,`${subscription.number} (${customer.name}) expires ${subscription.ends}.`,`subscription-expiry-${stage}-staff`,subscription.id);
+  if(process.env.SMTP_HOST){
+    try{
+      await nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:process.env.SMTP_PORT==='465',auth:process.env.SMTP_USER?{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}:undefined}).sendMail({from:process.env.MAIL_FROM||'no-reply@brightloop.local',to:customer.email,subject,text:textBody,html:htmlBody});
+      audit({id:'system',name:'Automation'},`Sent ${stage} expiry email to ${customer.email} for ${subscription.number}`);
+    }catch(err){console.error(`Failed to send ${stage} expiry email to ${customer.email}:`,err.message);}
+  }else{
+    console.log(`[Expiry Email - ${stage}] to ${customer.email}: ${subject} (Expires: ${subscription.ends})`);
+  }
+}
+function subscriptionAutomation(){
+  const today=new Date().toISOString().slice(0,10),plans=all('plans');
+  for(const subscription of all('subscriptions')){
+    if(['Closed','Draft'].includes(subscription.status))continue;
+    if(!subscription.ends)continue;
+    const todayMs=new Date(`${today}T00:00:00Z`).getTime();
+    const endMs=new Date(`${subscription.ends}T00:00:00Z`).getTime();
+    const daysRemaining=Math.round((endMs-todayMs)/86400000);
+    if(daysRemaining<=7&&daysRemaining>1)sendExpiryEmail(subscription,'week_before',daysRemaining).catch(e=>console.error('Expiry mail error',e.message));
+    if(daysRemaining<=1&&daysRemaining>0)sendExpiryEmail(subscription,'day_before',daysRemaining).catch(e=>console.error('Expiry mail error',e.message));
+    if(daysRemaining<=0)sendExpiryEmail(subscription,'on_expiry',daysRemaining).catch(e=>console.error('Expiry mail error',e.message));
+    const plan=plans.find(p=>p.id===subscription.planId);
+    if(plan?.autoClose===true&&daysRemaining<0){
+      put('subscriptions',{...subscription,status:'Closed',closedReason:'Plan ended automatically'});
+      notifyRoles('Subscription closed automatically',`${subscription.number||'Subscription'} reached its configured end date.`,'subscription-auto-closed',subscription.id);
+      notify(customerUserId(subscription.customerId),'Subscription ended',`${subscription.number||'Your subscription'} reached its end date and was closed.`,'subscription-auto-closed-customer',subscription.id);
+    }
+  }
+}
+function assertSubscriptionTransition(previous,next){
+  if(!previous||previous===next)return;const allowed={Draft:['Quotation','Confirmed','Closed'],Quotation:['Confirmed','Closed'],Confirmed:['Active','Closed'],Active:['Paused','Closed'],Paused:['Active','Closed'],Closed:[]};if(!allowed[previous]?.includes(next))fail(`Subscription cannot move from ${previous} to ${next}.`);
 }
 const attempts=new Map();
 function throttle(key){const now=Date.now();const item=attempts.get(key)||{n:0,expires:now+900000};if(item.expires<now){item.n=0;item.expires=now+900000;}item.n++;attempts.set(key,item);if(item.n>30)fail('Too many attempts. Please try again in 15 minutes.',429);}
 async function body(req){let data='';for await(const chunk of req){data+=chunk;if(data.length>100000)fail('Request too large',413);}try{return data?JSON.parse(data):{};}catch{fail('Invalid JSON');}}
 function validate(type,r){
-  if(['products','plans','customers','discounts','taxes'].includes(type)&&!String(r.name||'').trim())fail('Name is required.');
-  for(const key of ['price','cost','quantity','unitPrice','value','rate','minQuantity','limit','amount'])if(r[key]!==undefined && (!Number.isFinite(Number(r[key]))||Number(r[key])<0||Number(r[key])>1e10))fail(`${key} must be a valid positive number.`);
+  if(['products','plans','customers','quotationTemplates','discounts','taxes'].includes(type)&&!String(r.name||'').trim())fail('Name is required.');
+  for(const key of ['price','cost','quantity','unitPrice','value','rate','minQuantity','minPurchase','limit','amount','validDays'])if(r[key]!==undefined&&r[key]!==''&&(!Number.isFinite(Number(r[key]))||Number(r[key])<0||Number(r[key])>1e10))fail(`${key} must be a valid positive number.`);
   if(type==='customers'){if(!/^\S+@\S+\.\S+$/.test(r.email||''))fail('Enter a valid customer email.');r.email=r.email.toLowerCase().trim();}
   if(type==='products'){
     if(r.productType&&!['Software','Service','Add-on'].includes(r.productType))fail('Choose Software, Service or Add-on.');
@@ -85,19 +167,21 @@ function validate(type,r){
   if(type==='plans'){
     if(r.productId&&!all('products').some(p=>p.id===r.productId))fail('Choose a product.');
     if(r.currency&&!['INR','USD'].includes(r.currency))fail('Choose a supported currency.');
-    for(const key of ['allowPause','allowClose','allowRenew'])if(r[key]!==undefined){if(r[key]==='')r[key]=false;if(![true,false,'true','false'].includes(r[key]))fail('Choose a valid plan permission.');r[key]=r[key]===true||r[key]==='true';}
+    for(const key of ['allowPause','allowClose','allowRenew','autoClose'])if(r[key]!==undefined){if(r[key]==='')r[key]=false;if(![true,false,'true','false'].includes(r[key]))fail('Choose a valid plan permission.');r[key]=r[key]===true||r[key]==='true';}
     if(r.variantMultiplier==='')r.variantMultiplier=1;
     for(const [key,type] of [['taxId','taxes'],['discountId','discounts']])if(r[key]&&!all(type).some(t=>t.id===r[key]))fail('Choose valid tax and discount rules.');
     if(r.variantMultiplier!==undefined&&(!Number.isFinite(Number(r.variantMultiplier))||Number(r.variantMultiplier)<0||Number(r.variantMultiplier)>366))fail('Choose a valid variant billing multiplier.');
   }
   if(type==='plans'&&!['Daily','Weekly','Monthly','Yearly'].includes(r.cycle))fail('Choose a billing cycle.');
   if(type==='discounts'&&!['Fixed','Percentage'].includes(r.kind))fail('Choose a discount type.');
+  if(type==='discounts'){r.scope=r.scope||'Subscription';if(!['Subscription','Product'].includes(r.scope))fail('Choose a valid discount scope.');if(r.scope==='Product'&&!all('products').some(p=>p.id===r.productId))fail('Choose the product this discount applies to.');if(r.scope==='Subscription')r.productId='';}
   if(type==='taxes'&&Number(r.rate)>100)fail('Tax rate cannot exceed 100%.');
   if(type==='discounts'&&r.kind==='Percentage'&&Number(r.value)>100)fail('Discount cannot exceed 100%.');
   for(const key of ['starts','ends','due','date'])if(r[key] && (!/^\d{4}-\d{2}-\d{2}$/.test(r[key])||!Number.isFinite(Date.parse(r[key]))))fail('Enter valid dates.');
   if(r.starts&&r.ends&&r.ends<r.starts)fail('End date must follow start date.');
-  if(['subscriptions','quotations'].includes(type)){
-    if(!all('customers').some(c=>c.id===r.customerId))fail('Choose a customer.');
+  if(['subscriptions','quotations','quotationTemplates'].includes(type)){
+    if(type==='quotationTemplates'){if(!Number.isInteger(Number(r.validDays))||Number(r.validDays)<1||Number(r.validDays)>365)fail('Template validity must be between 1 and 365 days.');r.starts=r.starts||new Date().toISOString().slice(0,10);}
+    else if(!all('customers').some(c=>c.id===r.customerId))fail('Choose a customer.');
     let prod=all('products').find(p=>p.id===r.productId||p.key===r.productId||(r.productId&&p.name.trim().toLowerCase()===String(r.productId).trim().toLowerCase()));
     if(!prod&&r.planId){const pl=all('plans').find(p=>p.id===r.planId);if(pl?.productId)prod=all('products').find(p=>p.id===pl.productId);}
     if(!prod)fail('Choose a product.');r.productId=prod.id;
@@ -107,6 +191,8 @@ function validate(type,r){
     if(r.taxId&&!all('taxes').some(t=>t.id===r.taxId))fail('Choose a valid tax rule.');
     if(r.discountId&&!all('discounts').some(t=>t.id===r.discountId))fail('Choose a valid discount.');
     if(!r.starts)fail('Start date is required.');r.cycle=plan.cycle;
+    const rawLines=Array.isArray(r.lines)&&r.lines.length?r.lines:[{productId:r.productId,planId:r.planId,variantId:r.variantId,variantName:r.variantName,quantity:r.quantity,unitPrice:r.unitPrice,taxId:r.taxId||'',discountId:r.discountId||''}];if(rawLines.length>25)fail('Use no more than 25 product lines.');r.lines=rawLines.map((line,index)=>{const linePlan=all('plans').find(p=>p.id===(line.planId||r.planId)),lineProduct=all('products').find(p=>p.id===(line.productId||linePlan?.productId));if(!linePlan||!lineProduct)fail(`Choose a valid product and plan for line ${index+1}.`);const quantity=Number(line.quantity),unitPrice=Number(line.unitPrice);if(!Number.isInteger(quantity)||quantity<Math.max(1,Number(linePlan.minQuantity||1))||!Number.isFinite(unitPrice)||unitPrice<0)fail(`Enter valid pricing for line ${index+1}.`);if((linePlan.starts&&r.starts<linePlan.starts)||(linePlan.ends&&r.starts>linePlan.ends))fail(`The plan on line ${index+1} is unavailable on this start date.`);if(line.taxId&&!all('taxes').some(t=>t.id===line.taxId))fail(`Choose a valid tax for line ${index+1}.`);return {id:line.id||uid(),productId:lineProduct.id,planId:linePlan.id,variantId:line.variantId||'',variantName:String(line.variantName||''),quantity,unitPrice,taxId:line.taxId||'',discountId:line.discountId||''};});
+    const primary=r.lines[0];Object.assign(r,{productId:primary.productId,planId:primary.planId,variantId:primary.variantId,variantName:primary.variantName,quantity:primary.quantity,unitPrice:primary.unitPrice,taxId:r.taxId||primary.taxId||'',discountId:r.discountId||primary.discountId||''});
     if(type==='subscriptions'&&!['Draft','Quotation','Confirmed','Active','Paused','Closed'].includes(r.status))fail('Invalid status.');
   }
 }
@@ -138,12 +224,24 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
   if(path==='/api/auth/me'&&req.method==='GET')return send({user:publicUser(u)});
   if(path==='/api/auth/logout'&&req.method==='POST'){db.prepare('DELETE FROM sessions WHERE token=?').run(hash(token));return send({ok:true},200,{'Set-Cookie':'session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'});}
   if(path==='/api/profile'&&req.method==='POST'){if(!b.name?.trim())fail('Name is required.');db.prepare('UPDATE users SET name=? WHERE id=?').run(b.name.trim(),u.id);const cust=all('customers').find(c=>c.userId===u.id||c.email===u.email);if(cust)put('customers',{...cust,name:b.name.trim()});audit(u,'Updated profile name');return send({user:{...publicUser(u),name:b.name.trim()}});}
-  if(path==='/api/state'&&req.method==='GET'){const data=Object.fromEntries(types.map(t=>[t,all(t)]));if(u.role==='customer'){data.catalog=softwarePortal.catalog();const ids=data.customers.filter(c=>c.userId===u.id).map(c=>c.id);for(const t of ['subscriptions','quotations','invoices'])data[t]=data[t].filter(r=>ids.includes(r.customerId));const invoices=data.invoices.map(i=>i.id);data.payments=data.payments.filter(p=>invoices.includes(p.invoiceId));data.customers=data.customers.filter(c=>ids.includes(c.id));data.products=data.products.filter(p=>data.subscriptions.some(s=>s.productId===p.id)).map(({id,name,price,currency})=>({id,name,price,currency}));data.discounts=[];data.taxes=[];}return send(data);}
+  if(path==='/api/notifications'&&req.method==='GET'){quotationAutomation();const items=db.prepare('SELECT id,title,message,type,referenceId,createdAt,readAt FROM notifications WHERE userId=? ORDER BY createdAt DESC LIMIT 30').all(u.id);return send({items,unread:items.filter(n=>!n.readAt).length});}
+  if(path==='/api/notifications/all'&&req.method==='POST'){db.prepare('UPDATE notifications SET readAt=? WHERE userId=? AND readAt IS NULL').run(new Date().toISOString(),u.id);return send({ok:true});}
+  const notificationMatch=path.match(/^\/api\/notifications\/([a-f0-9]+)\/read$/);if(notificationMatch&&req.method==='POST'){const item=db.prepare('SELECT id FROM notifications WHERE id=? AND userId=?').get(notificationMatch[1],u.id);if(!item)fail('Notification not found.',404);db.prepare('UPDATE notifications SET readAt=COALESCE(readAt,?) WHERE id=? AND userId=?').run(new Date().toISOString(),notificationMatch[1],u.id);return send({ok:true});}
+  if(path==='/api/state'&&req.method==='GET'){subscriptionAutomation();const data=Object.fromEntries(types.map(t=>[t,all(t)]));if(u.role==='customer'){data.catalog=softwarePortal.catalog();const ids=data.customers.filter(c=>c.userId===u.id).map(c=>c.id);for(const t of ['subscriptions','quotations','invoices'])data[t]=data[t].filter(r=>ids.includes(r.customerId));const invoices=data.invoices.map(i=>i.id);data.payments=data.payments.filter(p=>invoices.includes(p.invoiceId));data.customers=data.customers.filter(c=>ids.includes(c.id));const ownedProductIds=new Set(data.subscriptions.flatMap(s=>recordLines(s).map(line=>line.productId)));data.products=data.products.filter(p=>ownedProductIds.has(p.id)).map(({id,name,price,currency})=>({id,name,price,currency}));data.quotationTemplates=[];data.discounts=[];data.taxes=[];}return send(data);}
   if(path.startsWith('/api/customer/'))return send(softwarePortal.handle(u,path,req.method,b));
   if(u.role==='customer')fail('You do not have permission to perform this action.',403);
+  if(path==='/api/reports/schema'&&req.method==='GET')return send(reportSchema());
+  if(path==='/api/reports/xlsx'&&req.method==='POST'){
+    const records=Object.fromEntries(types.map(type=>[type,all(type)]));
+    const report=await createExcelReport(b,records,publicUser(u));
+    audit(u,`Exported ${b.dataset} report with ${report.count} records`);
+    res.writeHead(200,{'Content-Type':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet','Content-Disposition':`attachment; filename="${report.filename}"`,'Content-Length':report.buffer.length,'Cache-Control':'no-store','X-Report-Count':String(report.count)});
+    res.end(report.buffer);return;
+  }
   if(path==='/api/team'&&req.method==='GET'){if(u.role!=='admin')fail('Administrator access required.',403);return send(db.prepare("SELECT id,name,email,role,COALESCE(status,'active') as status FROM users WHERE role IN ('admin','staff')").all());}
   if(path==='/api/admin/customers'&&req.method==='GET'){if(u.role!=='admin')fail('Administrator access required.',403);return send(db.prepare("SELECT id,name,email,role,COALESCE(status,'active') as status FROM users WHERE role='customer'").all());}
-  if(path==='/api/admin/stats'&&req.method==='GET'){if(u.role!=='admin')fail('Administrator access required.',403);const subs=all('subscriptions'),invs=all('invoices'),pays=all('payments'),custs=all('customers');const active=subs.filter(s=>s.status==='Active');const mrr=active.reduce((sum,s)=>sum+Number(s.unitPrice)*Number(s.quantity)*({Daily:30.4375,Weekly:52/12,Monthly:1,Yearly:1/12}[s.cycle]||1),0);const totalRevenue=pays.reduce((s,p)=>s+Number(p.amount),0);const owed=invs.filter(i=>i.status!=='Cancelled').reduce((s,i)=>{const paid=pays.filter(p=>p.invoiceId===i.id).reduce((a,p)=>a+Number(p.amount),0);return s+Math.max(0,Number(i.total)-paid);},0);const today=new Date().toISOString().slice(0,10);const overdue=invs.filter(i=>i.status!=='Paid'&&i.status!=='Cancelled'&&i.due<today);const staffCount=db.prepare("SELECT COUNT(*) as c FROM users WHERE role='staff' AND COALESCE(status,'active')='active'").get().c;const customerCount=custs.length;return send({mrr,totalRevenue,owed,activeSubscriptions:active.length,totalSubscriptions:subs.length,overdueInvoices:overdue.length,overdueAmount:overdue.reduce((s,i)=>{const paid=pays.filter(p=>p.invoiceId===i.id).reduce((a,p)=>a+Number(p.amount),0);return s+Math.max(0,Number(i.total)-paid);},0),totalInvoices:invs.length,paidInvoices:invs.filter(i=>i.status==='Paid').length,totalPayments:pays.length,totalCustomers:customerCount,staffCount,planCount:all('plans').length,productCount:all('products').length});}
+  const linkMatch=path.match(/^\/api\/admin\/customers\/([a-f0-9]+)\/link$/);if(linkMatch&&req.method==='POST'){if(u.role!=='admin')fail('Administrator access required.',403);const account=db.prepare("SELECT * FROM users WHERE id=? AND role='customer'").get(linkMatch[1]),customer=all('customers').find(c=>c.id===b.customerId);if(!account||!customer)fail('Choose a valid customer account and billing record.',404);if(customer.email.toLowerCase()!==account.email.toLowerCase())fail('The account and billing record email addresses must match.');if(customer.userId&&customer.userId!==account.id)fail('This billing record is linked to another account.');put('customers',{...customer,userId:account.id});for(const duplicate of all('customers').filter(c=>c.id!==customer.id&&c.userId===account.id)){const used=['subscriptions','quotations'].some(type=>all(type).some(record=>record.customerId===duplicate.id));if(!used)db.prepare("DELETE FROM records WHERE id=? AND type='customers'").run(duplicate.id);}audit(u,`Linked customer account ${account.email}`);return send({ok:true});}
+  if(path==='/api/admin/stats'&&req.method==='GET'){if(u.role!=='admin')fail('Administrator access required.',403);const subs=all('subscriptions'),invs=all('invoices'),pays=all('payments'),custs=all('customers');const active=subs.filter(s=>s.status==='Active');const mrr=active.reduce((sum,s)=>sum+recordLines(s).reduce((lineSum,line)=>lineSum+line.unitPrice*line.quantity,0)*({Daily:30.4375,Weekly:52/12,Monthly:1,Yearly:1/12}[s.cycle]||1),0);const totalRevenue=pays.reduce((s,p)=>s+Number(p.amount),0);const owed=invs.filter(i=>i.status!=='Cancelled').reduce((s,i)=>{const paid=pays.filter(p=>p.invoiceId===i.id).reduce((a,p)=>a+Number(p.amount),0);return s+Math.max(0,Number(i.total)-paid);},0);const today=new Date().toISOString().slice(0,10);const overdue=invs.filter(i=>i.status!=='Paid'&&i.status!=='Cancelled'&&i.due<today);const staffCount=db.prepare("SELECT COUNT(*) as c FROM users WHERE role='staff' AND COALESCE(status,'active')='active'").get().c;const customerCount=custs.length;return send({mrr,totalRevenue,owed,activeSubscriptions:active.length,totalSubscriptions:subs.length,overdueInvoices:overdue.length,overdueAmount:overdue.reduce((s,i)=>{const paid=pays.filter(p=>p.invoiceId===i.id).reduce((a,p)=>a+Number(p.amount),0);return s+Math.max(0,Number(i.total)-paid);},0),totalInvoices:invs.length,paidInvoices:invs.filter(i=>i.status==='Paid').length,totalPayments:pays.length,totalCustomers:customerCount,staffCount,planCount:all('plans').length,productCount:all('products').length});}
   if(path==='/api/admin/audit'&&req.method==='GET'){if(u.role!=='admin')fail('Administrator access required.',403);const rows=db.prepare('SELECT audit.id,audit.time,audit.action,users.name as userName,users.email as userEmail FROM audit LEFT JOIN users ON audit.userId=users.id ORDER BY audit.id DESC LIMIT 50').all();return send(rows);}
   const staffMatch=path.match(/^\/api\/(staff|users)\/([a-f0-9]+)(?:\/(deactivate|activate|reset))?$/);
   if(staffMatch&&req.method==='POST'){if(u.role!=='admin')fail('Administrator access required.',403);const [,userType,staffId,staffAction]=staffMatch;const target=db.prepare('SELECT * FROM users WHERE id=?').get(staffId);if(!target||(userType==='staff'&&!['staff','admin'].includes(target.role)))fail('User not found.',404);
@@ -154,28 +252,31 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
   }
   if(path==='/api/invoice-action'&&req.method==='POST'){
     const i=all('invoices').find(i=>i.id===b.id);if(!i)fail('Invoice not found.',404);
-    if(b.action==='cancel'){if(all('payments').some(p=>p.invoiceId===i.id))fail('An invoice with payments cannot be cancelled.');put('invoices',{...i,status:'Cancelled'});}
-    else if(b.action==='send'){if(!process.env.SMTP_HOST)fail('Configure SMTP to email invoices.',503);const c=all('customers').find(c=>c.id===i.customerId);if(!c)fail('Invoice customer not found.',404);const currency=i.currency||'INR';const formatAmount=value=>new Intl.NumberFormat('en-IN',{style:'currency',currency,maximumFractionDigits:2}).format(Number(value||0));await nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:process.env.SMTP_PORT==='465',auth:process.env.SMTP_USER?{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}:undefined}).sendMail({from:process.env.MAIL_FROM,to:c.email,subject:`Invoice ${i.number}`,text:`Hello ${c.name},\nInvoice ${i.number}\nDue: ${i.due}\nSubtotal: ${formatAmount(i.subtotal)}\nDiscount: ${formatAmount(i.discount)}\nTax: ${formatAmount(i.tax)}\nTotal: ${formatAmount(i.total)}\nPlease sign in to your Brightloop portal to view your invoice.`});}
+    if(b.action==='confirm'){if(i.status!=='Draft')fail('Only a draft invoice can be confirmed.');put('invoices',{...i,status:'Confirmed',confirmedAt:new Date().toISOString()});notify(customerUserId(i.customerId),'Invoice confirmed',`${i.number} is confirmed and due on ${i.due}.`,'invoice-confirmed-customer',i.id);}
+    else if(b.action==='cancel'){if(!['Draft','Confirmed'].includes(i.status))fail('Only an unpaid invoice can be cancelled.');if(all('payments').some(p=>p.invoiceId===i.id))fail('An invoice with payments cannot be cancelled.');put('invoices',{...i,status:'Cancelled'});}
+    else if(b.action==='send'){if(!['Confirmed','Paid'].includes(i.status))fail('Confirm this invoice before sending it.');if(!process.env.SMTP_HOST)fail('Configure SMTP to email invoices.',503);const c=all('customers').find(c=>c.id===i.customerId);if(!c)fail('Invoice customer not found.',404);const currency=i.currency||'INR';const formatAmount=value=>new Intl.NumberFormat('en-IN',{style:'currency',currency,maximumFractionDigits:2}).format(Number(value||0));await nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:process.env.SMTP_PORT==='465',auth:process.env.SMTP_USER?{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}:undefined}).sendMail({from:process.env.MAIL_FROM,to:c.email,subject:`Invoice ${i.number}`,text:`Hello ${c.name},\nInvoice ${i.number}\nDue: ${i.due}\nSubtotal: ${formatAmount(i.subtotal)}\nDiscount: ${formatAmount(i.discount)}\nTax: ${formatAmount(i.tax)}\nTotal: ${formatAmount(i.total)}\nPlease sign in to your Brightloop portal to view your invoice.`});}
     else fail('Invalid invoice action.');audit(u,`${b.action} invoice ${i.number}`);return send({ok:true});
   }
   if(path==='/api/convert'&&req.method==='POST'){
     const q=all('quotations').find(q=>q.id===b.id);if(!q)fail('Quotation not found.',404);if(q.subscriptionId)fail('This quotation has already been converted.');if(q.ends&&q.ends<new Date().toISOString().slice(0,10))fail('This quotation has expired.');
-    const s={...q,id:uid(),number:`SUB-${uid().slice(0,8).toUpperCase()}`,status:'Confirmed',ends:'',nextBilling:q.starts};validate('subscriptions',s);db.exec('BEGIN IMMEDIATE');try{put('subscriptions',s);put('quotations',{...q,status:'Confirmed',subscriptionId:s.id});db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}audit(u,'Converted quotation');return send(s);
+    const s={...q,id:uid(),number:`SUB-${uid().slice(0,8).toUpperCase()}`,status:'Confirmed',ends:'',nextBilling:q.starts};validate('subscriptions',s);db.exec('BEGIN IMMEDIATE');try{put('subscriptions',s);put('quotations',{...q,status:'Confirmed',subscriptionId:s.id});db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}notifyQuotation(q,'converted');audit(u,'Converted quotation');return send(s);
   }
   if(path==='/api/billing'&&req.method==='POST'){const count=bill();audit(u,`Generated ${count} invoices`);return send({count});}
   if(path==='/api/staff'&&req.method==='POST'){if(u.role!=='admin')fail('Administrator access required.',403);if(!validPassword(b.password)||!/^\S+@\S+\.\S+$/.test(email)||!b.name?.trim())fail('Enter a name, valid email and a strong password.');if(db.prepare('SELECT id FROM users WHERE email=?').get(email))fail('Email already registered.');db.prepare('INSERT INTO users VALUES(?,?,?,?,?,?)').run(uid(),b.name.trim(),email,passwordHash(b.password),'staff','active');audit(u,'Staff account created');return send({ok:true});}
-  const match=path.match(/^\/api\/records\/([a-z]+)(?:\/([a-f0-9]+))?$/);if(!match||!types.includes(match[1]))fail('Not found',404);const [,type,id]=match;if(['products','plans','discounts','taxes'].includes(type)&&u.role!=='admin')fail('Administrator access required.',403);
+  const listMatch=path.match(/^\/api\/records\/([A-Za-z]+)$/);if(listMatch&&req.method==='GET'&&types.includes(listMatch[1])){const page=Math.max(1,Number(url.searchParams.get('page')||1)),limit=Math.min(200,Math.max(1,Number(url.searchParams.get('limit')||50))),offset=(page-1)*limit,total=db.prepare('SELECT COUNT(*) AS count FROM records WHERE type=?').get(listMatch[1]).count,items=db.prepare('SELECT body FROM records WHERE type=? ORDER BY rowid DESC LIMIT ? OFFSET ?').all(listMatch[1],limit,offset).map(row=>JSON.parse(row.body));return send({items,page,limit,total,pages:Math.ceil(total/limit)});}
+  const match=path.match(/^\/api\/records\/([A-Za-z]+)(?:\/([a-f0-9]+))?$/);if(!match||!types.includes(match[1]))fail('Not found',404);const [,type,id]=match;if(['products','plans','discounts','taxes'].includes(type)&&u.role!=='admin')fail('Administrator access required.',403);
   if(req.method==='POST'||req.method==='PATCH'){
     const old=id?all(type).find(r=>r.id===id):undefined;if(id&&!old)fail('Record not found.',404);let r={...old,...b,id:id||uid()};delete r.password;
     if(type==='invoices')fail('Invoices are generated from subscriptions. Use invoice actions.');
-    if(type==='payments'){if(id)fail('Payments cannot be edited.');validate(type,r);const i=all('invoices').find(i=>i.id===r.invoiceId);if(!i||i.status==='Cancelled')fail('Choose a confirmed invoice.');const paid=all('payments').filter(p=>p.invoiceId===i.id).reduce((s,p)=>s+Number(p.amount),0);if(!(Number(r.amount)>0)||Number(r.amount)>i.total-paid+0.001)fail('Amount exceeds the outstanding balance or is invalid.');if(!r.date||!['Bank transfer','Card','Cash','Other'].includes(r.method))fail('Payment date and method are required.');db.exec('BEGIN IMMEDIATE');try{put(type,r);put('invoices',{...i,status:paid+Number(r.amount)>=i.total-0.001?'Paid':'Confirmed'});db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}}
-    else {validate(type,r);if(type==='subscriptions'){if(old&&old.status==='Closed'&&r.status!=='Closed')fail('Renew a closed subscription as a new contract.');if(old&&all('invoices').some(i=>i.subscriptionId===id)&&['starts','customerId','productId','quantity','unitPrice','planId'].some(k=>String(old[k])!==String(r[k])))fail('Billed contract details cannot be changed. Create a new subscription for pricing changes.');if(old&&old.status==='Paused'&&r.status==='Active'){let due=r.nextBilling||r.starts;const today=new Date().toISOString().slice(0,10);while(due<today)due=nextDate(due,r.cycle||'Monthly',Number(r.starts.slice(8,10)));r.nextBilling=due;}else{r.nextBilling=old?.nextBilling||r.starts;}}if(type==='customers'){const account=db.prepare('SELECT id FROM users WHERE email=? AND role=?').get(r.email,'customer');r.userId=account?.id||null;}if(type==='quotations'&&old?.subscriptionId)r.subscriptionId=old.subscriptionId;if(type==='discounts')r.used=old?.used||0;put(type,r);}audit(u,`${id?'Updated':'Created'} ${type}: ${r.id}`);return send(r);
+    if(type==='subscriptions'&&old&&all('invoices').some(i=>i.subscriptionId===id)&&['starts','customerId','productId','planId','quantity','unitPrice','lines'].some(key=>b[key]!==undefined&&JSON.stringify(b[key])!==JSON.stringify(old[key])))fail('Billed contract details cannot be changed. Create a new subscription for pricing changes.');
+    if(type==='payments'){if(id)fail('Payments cannot be edited.');validate(type,r);const i=all('invoices').find(i=>i.id===r.invoiceId);if(!i||i.status!=='Confirmed')fail('Choose a confirmed unpaid invoice.');const paid=all('payments').filter(p=>p.invoiceId===i.id).reduce((s,p)=>s+Number(p.amount),0);if(!(Number(r.amount)>0)||Number(r.amount)>i.total-paid+0.001)fail('Amount exceeds the outstanding balance or is invalid.');if(!r.date||!['Bank transfer','Card','Cash','Other'].includes(r.method))fail('Payment date and method are required.');db.exec('BEGIN IMMEDIATE');try{put(type,r);put('invoices',{...i,status:paid+Number(r.amount)>=i.total-0.001?'Paid':'Confirmed'});db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}}
+    else {validate(type,r);if(type==='subscriptions'){assertSubscriptionTransition(old?.status,r.status);if(old&&all('invoices').some(i=>i.subscriptionId===id)&&['starts','customerId','lines'].some(k=>JSON.stringify(old[k])!==JSON.stringify(r[k])))fail('Billed contract details cannot be changed. Create a new subscription for pricing changes.');if(old&&old.status==='Paused'&&r.status==='Active'){let due=r.nextBilling||r.starts;const today=new Date().toISOString().slice(0,10);while(due<today)due=nextDate(due,r.cycle||'Monthly',Number(r.starts.slice(8,10)));r.nextBilling=due;}else{r.nextBilling=old?.nextBilling||r.starts;}}if(type==='customers'){const account=db.prepare('SELECT id FROM users WHERE email=? AND role=?').get(r.email,'customer');r.userId=account?.id||null;}if(type==='quotations'&&old?.subscriptionId)r.subscriptionId=old.subscriptionId;if(type==='discounts')r.used=old?.used||0;put(type,r);if(type==='quotations'&&!id)notifyQuotation(r,'created');}audit(u,`${id?'Updated':'Created'} ${type}: ${r.id}`);return send(r);
   }
   if(req.method==='DELETE'){if(['payments','invoices','subscriptions'].includes(type))fail('Financial records are retained. Close or cancel them instead.');const references={customers:['customerId'],products:['productId'],plans:['planId'],discounts:['discountId'],taxes:['taxId']};if(types.some(t=>all(t).some(r=>(references[type]||[]).some(key=>r[key]===id))))fail('This record is in use and cannot be deleted.');db.prepare('DELETE FROM records WHERE id=? AND type=?').run(id,type);audit(u,`Deleted ${type}: ${id}`);return send({ok:true});}
   fail('Method not allowed',405);
 }catch(e){send({error:e.code&&typeof e.code==='number'?e.message:'The request could not be completed.'},typeof e.code==='number'?e.code:500);if(!e.code)console.error(e);}});
 server.listen(Number(process.env.PORT||3000),'127.0.0.1',()=>console.log(`Subscript running at ${process.env.APP_URL||'http://localhost:3000'}`));
-const timer=setInterval(()=>{try{bill();}catch(e){console.error('Billing error',e.message);}},60000);timer.unref();
+const timer=setInterval(()=>{try{subscriptionAutomation();bill();quotationAutomation();}catch(e){console.error('Scheduled automation error',e.message);}},60000);timer.unref();
 
 server.on('close',()=>{clearInterval(timer);db.close();});
-export {server};
+export {server,sendExpiryEmail,subscriptionAutomation,db};

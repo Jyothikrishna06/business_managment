@@ -151,6 +151,42 @@ dialog::backdrop { background: #131b1660; backdrop-filter: blur(3px); }
 .account-popover { background: #fff; border: 1px solid var(--line); box-shadow: 0 15px 50px #00000012; border-radius: 24px; }
 #toast { background: #151a17; border-radius: 16px; box-shadow: 0 8px 30px #0002; }
 
+/* Staff report builder follows the quiet, question-by-question rhythm of a form. */
+.report-builder { overflow: visible; }
+.report-builder-head { padding: 28px 30px; display: flex; align-items: center; justify-content: space-between; gap: 24px; border-bottom: 1px solid var(--line); }
+.report-builder-head > div:first-child > span, .report-preview > span { color: var(--brand-strong); font-size: 10px; font-weight: 800; letter-spacing: .14em; }
+.report-builder-head h2 { margin: 8px 0 6px; font-size: 25px; }
+.report-builder-head p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.7; max-width: 620px; }
+.excel-file-icon { width: 68px; height: 68px; flex: 0 0 68px; border-radius: 21px; background: var(--brand-soft); color: var(--brand-strong); display: grid; place-items: center; position: relative; }
+.excel-file-icon .material-symbols-outlined { font-size: 29px; }
+.excel-file-icon small { position: absolute; right: -6px; bottom: -5px; padding: 4px 7px; border-radius: 999px; background: #111; color: #fff; font-size: 8px; font-weight: 800; letter-spacing: .08em; }
+.report-builder-grid { display: grid; grid-template-columns: minmax(0,1.25fr) minmax(290px,.75fr); gap: 26px; padding: 28px 30px 32px; }
+.report-form { display: grid; gap: 16px; }
+.report-question { border: 1px solid var(--line); border-radius: 18px; padding: 18px; background: #fff; min-width: 0; }
+.report-question > label, .report-question legend { display: block; color: #25282c; font-size: 12px; font-weight: 700; margin-bottom: 11px; }
+.report-question input:not([type='checkbox']), .report-question select { width: 100%; height: 45px; border: 1px solid #dedede; background: var(--surface); border-radius: 13px; padding: 0 13px; color: #25282c; }
+.report-question input:focus, .report-question select:focus { outline: 2px solid var(--brand-strong); outline-offset: 2px; background: #fff; }
+.report-question small { display: block; color: var(--muted); font-size: 10px; line-height: 1.6; margin-top: 9px; }
+fieldset.report-question { margin: 0; }
+.report-field-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 9px; }
+.report-checkbox { min-height: 42px; border-radius: 12px; background: var(--surface); display: flex; align-items: center; gap: 9px; padding: 9px 11px; color: #44474c; font-size: 11px; font-weight: 600; cursor: pointer; }
+.report-checkbox:has(input:checked) { background: var(--brand-soft); color: #154c29; }
+.report-checkbox input { width: 16px; height: 16px; flex: 0 0 auto; }
+.report-filter-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; }
+.report-filter-grid .report-question { padding: 15px; }
+.report-form .error { min-height: 20px; margin: 0; }
+.report-form .primary-button { justify-self: start; }
+.report-preview { background: #f7f8f7; border: 1px solid var(--line); border-radius: 22px; padding: 23px; align-self: start; position: sticky; top: 105px; }
+.report-preview h3 { font-size: 20px; margin: 9px 0 18px; overflow-wrap: anywhere; }
+.preview-sheet { background: #fff; border: 1px solid #dfe4e1; border-radius: 15px; overflow: hidden; box-shadow: 0 9px 25px #0000000b; }
+.preview-sheet-head { padding: 14px; background: #17864b; color: #fff; display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+.preview-sheet-head strong { font-size: 11px; }
+.preview-sheet-head small { font-size: 9px; opacity: .8; }
+.preview-columns { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); padding: 7px; min-height: 128px; align-content: start; }
+.preview-columns span { padding: 8px; border-right: 1px solid #edf0ee; border-bottom: 1px solid #edf0ee; color: #59605c; font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preview-columns em { grid-column: 1/-1; padding: 20px; color: var(--muted); font-size: 10px; }
+.report-preview > p { color: var(--muted); font-size: 10px; line-height: 1.7; margin: 16px 1px 0; }
+
 /* The sign-in page borrows the large editorial type and generous white space. */
 .auth-shell { background: #fff; padding: 36px; }
 .auth-layout { max-width: 1260px; width: 100%; background: #fff; border-radius: 0; box-shadow: none; min-height: 660px; grid-template-columns: 1.15fr 1fr; border: 0; gap: 48px; }
@@ -188,6 +224,8 @@ dialog::backdrop { background: #131b1660; backdrop-filter: blur(3px); }
   .brand .console { display: none; }
   .auth-layout { gap: 32px; }
   .auth-panel { padding: 32px; }
+  .report-builder-grid { grid-template-columns: 1fr; }
+  .report-preview { position: static; }
 }
 @media (max-width: 850px) {
   .auth-shell { padding: 24px; }
@@ -224,6 +262,9 @@ dialog::backdrop { background: #131b1660; backdrop-filter: blur(3px); }
   .software-welcome h2, .portal-welcome h2 { font-size: 25px; }
   .brand::before { width: 11px; height: 22px; border-width: 4px; }
   .profile-card { padding: 22px; }
+  .report-builder-head, .report-builder-grid { padding: 22px; }
+  .excel-file-icon { display: none; }
+  .report-field-grid, .report-filter-grid { grid-template-columns: 1fr; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; }

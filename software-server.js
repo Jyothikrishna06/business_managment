@@ -4,8 +4,43 @@ export function createSoftwarePortal({all,put,uid,fail,audit,nextDate}){
  const available=p=>(!p.starts||p.starts<=today())&&(!p.ends||p.ends>=today());
  function catalog(){return all('products').filter(p=>['Software','Service','Add-on'].includes(p.productType)).map(({id,name,productType,price,currency,description,features,icon,variants})=>({id,name,productType,price,currency:currency||'INR',description:description||'',features:features||[],icon:icon||'apps',variants:variants||[{id:'standard',name:'Standard',extraPrice:0}],plans:all('plans').filter(p=>p.productId===id&&available(p)&&p.price!==null&&p.price!==''&&p.price!==undefined&&Number.isFinite(Number(p.price))).map(({id,name,price,currency,cycle,minQuantity,variantMultiplier,allowPause,allowClose,allowRenew})=>({id,name,price:Number(price),currency:currency||'INR',cycle,minQuantity:Number(minQuantity||1),variantMultiplier:Number(variantMultiplier||1),allowPause:allowPause===true,allowClose:allowClose===true,allowRenew:allowRenew===true}))}));}
  function own(user,id){const s=all('subscriptions').find(s=>s.id===id),customer=s&&all('customers').find(c=>c.id===s.customerId&&c.userId===user.id);if(!customer)fail('Subscription not found.',404);return s;}
+ function activateWithDemoPayment(s,user,customer,product,plan,variant,price,quantity){
+  const nextDue=nextDate(today(),plan.cycle||s.cycle||'Monthly',Number(today().slice(8,10)));
+  const updatedSub={...s,status:'Active',terms:'Demo Instant Payment',nextBilling:nextDue};
+  put('subscriptions',updatedSub);
+  const invoiceId=uid(),totalAmount=price*quantity;
+  const inv={
+    id:invoiceId,
+    number:`INV-${uid().slice(0,8).toUpperCase()}`,
+    customerId:customer.id,
+    subscriptionId:s.id,
+    billingDate:today(),
+    due:today(),
+    currency:s.currency,
+    status:'Paid',
+    line:{name:(product.name||'Subscription')+(variant.name?` · ${variant.name}`:''),quantity,unitPrice:price},
+    lines:[{productId:product.id,planId:plan.id,variantId:variant.id,variantName:variant.name,quantity,unitPrice:price,subtotal:totalAmount,total:totalAmount}],
+    customer:{name:customer.name||'Customer',email:customer.email||''},
+    terms:'Demo Instant Payment',
+    subtotal:totalAmount,
+    discount:0,
+    tax:0,
+    total:totalAmount
+  };
+  put('invoices',inv);
+  put('payments',{
+    id:uid(),
+    invoiceId:inv.id,
+    amount:totalAmount,
+    method:'Card',
+    date:today(),
+    notes:'Demo instant checkout payment'
+  });
+  audit(user,`Subscribed with demo payment to ${product.name} · ${variant.name} (${s.number})`);
+  return updatedSub;
+ }
  function draft(user,b){
-  if(Object.keys(b).some(k=>!['planId','variantId','quantity'].includes(k)))fail('Only a plan, variant and quantity may be selected.');
+  if(Object.keys(b).some(k=>!['planId','variantId','quantity','payNow'].includes(k)))fail('Only a plan, variant and quantity may be selected.');
   const plan=all('plans').find(p=>p.id===b.planId),product=plan&&all('products').find(p=>p.id===plan.productId);
   if(!plan||!product||plan.price===null||plan.price===''||plan.price===undefined||!available(plan)||!['Software','Service','Add-on'].includes(product.productType))fail('This software plan is unavailable.');
   const variant=(product.variants||[{id:'standard',name:'Standard',extraPrice:0}]).find(v=>v.id===(b.variantId||'standard'));
@@ -14,18 +49,37 @@ export function createSoftwarePortal({all,put,uid,fail,audit,nextDate}){
   const customer=all('customers').find(c=>c.userId===user.id);if(!customer)fail('Customer account not found.',404);
   const price=Math.round((Number(plan.price)+Number(variant.extraPrice)*Number(plan.variantMultiplier||1))*100)/100;
   if(!Number.isFinite(price)||price<0)fail('This plan has invalid pricing. Contact your administrator.');
-  const existing=all('subscriptions').find(s=>s.customerId===customer.id&&s.planId===plan.id&&s.variantId===variant.id&&Number(s.quantity)===quantity&&s.status==='Draft');if(existing)return existing;
-  const s={id:uid(),number:`SUB-${uid().slice(0,8).toUpperCase()}`,businessType:'software',customerId:customer.id,productId:product.id,planId:plan.id,variantId:variant.id,variantName:variant.name,quantity,unitPrice:price,currency:plan.currency||product.currency||'INR',cycle:plan.cycle,starts:today(),nextBilling:today(),ends:'',status:'Draft',terms:'Net 15',taxId:plan.taxId||'',discountId:plan.discountId||'',createdAt:new Date().toISOString()};put('subscriptions',s);audit(user,`Requested ${product.name} · ${variant.name}`);return s;
+  const isPayNow=b.payNow===true||b.payNow==='true';
+  if(!isPayNow){
+    const existing=all('subscriptions').find(s=>s.customerId===customer.id&&s.planId===plan.id&&s.variantId===variant.id&&Number(s.quantity)===quantity&&s.status==='Draft');if(existing)return existing;
+  }
+  const line={id:uid(),productId:product.id,planId:plan.id,variantId:variant.id,variantName:variant.name,quantity,unitPrice:price,taxId:plan.taxId||'',discountId:plan.discountId||''};
+  const s={id:uid(),number:`SUB-${uid().slice(0,8).toUpperCase()}`,businessType:'software',customerId:customer.id,...line,lines:[line],currency:plan.currency||product.currency||'INR',cycle:plan.cycle,starts:today(),nextBilling:today(),ends:'',status:isPayNow?'Active':'Draft',terms:isPayNow?'Demo Instant Payment':'Net 15',taxId:plan.taxId||'',discountId:plan.discountId||'',createdAt:new Date().toISOString()};
+  put('subscriptions',s);
+  if(isPayNow)return activateWithDemoPayment(s,user,customer,product,plan,variant,price,quantity);
+  audit(user,`Requested ${product.name} · ${variant.name}`);
+  return s;
  }
  function handle(user,path,method,b){
   if(user.role!=='customer')fail('Customer access required.',403);
   if(path==='/api/customer/subscriptions'&&method==='POST')return draft(user,b);
+ const payMatch=path.match(/^\/api\/customer\/subscriptions\/([a-f0-9]+)\/pay$/);
+ if(payMatch&&method==='POST'){
+  const s=own(user,payMatch[1]);
+  if(s.status!=='Draft')fail('Only draft subscriptions can be paid.',400);
+  const plan=all('plans').find(p=>p.id===s.planId),product=plan&&all('products').find(p=>p.id===plan.productId);
+  if(!plan||!product)fail('Plan or product no longer available.',404);
+  const variant=(product.variants||[{id:'standard',name:'Standard',extraPrice:0}]).find(v=>v.id===(s.variantId||'standard'))||{id:'standard',name:'Standard',extraPrice:0};
+  const customer=all('customers').find(c=>c.userId===user.id);
+  return activateWithDemoPayment(s,user,customer,product,plan,variant,s.unitPrice,s.quantity);
+ }
+  const addonMatch=path.match(/^\/api\/customer\/subscriptions\/([a-f0-9]+)\/addons$/);if(addonMatch){const s=own(user,addonMatch[1]);if(!['Confirmed','Active','Paused'].includes(s.status))fail('Add-ons can be changed after the subscription is confirmed.',403);const lines=Array.isArray(s.lines)&&s.lines.length?s.lines.map(line=>({...line})):[{id:uid(),productId:s.productId,planId:s.planId,variantId:s.variantId,variantName:s.variantName,quantity:s.quantity,unitPrice:s.unitPrice,taxId:s.taxId||''}];if(method==='POST'){if(Object.keys(b).some(key=>!['planId','variantId','quantity'].includes(key)))fail('Choose an add-on plan, variant and quantity.');const plan=all('plans').find(item=>item.id===b.planId),product=plan&&all('products').find(item=>item.id===plan.productId);if(!plan||product?.productType!=='Add-on'||!available(plan))fail('Choose an available add-on plan.');const variant=(product.variants||[{id:'standard',name:'Standard',extraPrice:0}]).find(item=>item.id===(b.variantId||'standard'));if(!variant)fail('Choose a valid add-on variant.');const quantity=Number(b.quantity);if(!Number.isInteger(quantity)||quantity<Math.max(1,Number(plan.minQuantity||1)))fail('Enter a valid add-on quantity.');const unitPrice=Math.round((Number(plan.price)+Number(variant.extraPrice)*Number(plan.variantMultiplier||1))*100)/100;lines.push({id:uid(),productId:product.id,planId:plan.id,variantId:variant.id,variantName:variant.name,quantity,unitPrice,taxId:plan.taxId||''});const updated={...s,lines};put('subscriptions',updated);audit(user,`Added ${product.name} to ${s.number}`);return updated;}if(method==='DELETE'){const line=lines.find(item=>item.id===b.lineId),product=line&&all('products').find(item=>item.id===line.productId);if(!line||product?.productType!=='Add-on')fail('Choose an attached add-on.',404);const updated={...s,lines:lines.filter(item=>item.id!==line.id)};put('subscriptions',updated);audit(user,`Removed ${product.name} from ${s.number}`);return updated;}fail('Action not allowed.',405);}
   const match=path.match(/^\/api\/customer\/subscriptions\/([a-f0-9]+)$/);if(!match||method!=='PATCH')fail('Action not allowed.',405);
   if(Object.keys(b).some(k=>k!=='action'))fail('Only a supported subscription action is allowed.');
   const s=own(user,match[1]),plan=all('plans').find(p=>p.id===s.planId);if(!plan)fail('Billing plan unavailable.');
   if(b.action==='renew'){
    if(plan.allowRenew!==true||s.status!=='Closed')fail('Renewal is not permitted for this subscription.',403);
-   const result=draft(user,{planId:s.planId,variantId:s.variantId,quantity:s.quantity});audit(user,`Requested renewal of ${s.number}`);return result;
+   const result=draft(user,{planId:s.planId,variantId:s.variantId,quantity:s.quantity});if(Array.isArray(s.lines)&&s.lines.length>1){result.lines=s.lines.map(line=>({...line}));put('subscriptions',result);}audit(user,`Requested renewal of ${s.number}`);return result;
   }
   const next={pause:'Paused',resume:'Active',close:'Closed'}[b.action];
   if(b.action==='pause'&&(plan.allowPause!==true||s.status!=='Active')||b.action==='resume'&&(plan.allowPause!==true||s.status!=='Paused'||s.ends&&s.ends<today())||b.action==='close'&&(plan.allowClose!==true||!['Active','Paused','Confirmed'].includes(s.status))||!next)fail('This action is not permitted by your billing plan.',403);
