@@ -80,11 +80,12 @@ test('accounts, authorization, billing, payments and password recovery',async t=
   /* staff cannot use change-password OTP endpoint */
   assert.equal((await call('/auth/otp/change/send','POST',{},staff.cookie)).status,403);
   assert.equal((await call('/auth/forgot','POST',{email:admin.email})).status,200);
-  const token=output.match(/reset=([a-f0-9]+)/)?.[1];assert.ok(token);
-  assert.equal((await call('/auth/reset','POST',{token:'invalid',password:'AnotherPass!43'})).status,400);
-  assert.equal((await call('/auth/reset','POST',{token,password:'AnotherPass!43'})).status,200);
+  const adminOtp=output.match(/OTP for make_a_ton@gmail\.com \(reset\): (\d{6})/)?.[1];assert.ok(adminOtp);
+  assert.equal((await call('/auth/otp/reset','POST',{email:admin.email,otp:'invalid',password:'AnotherPass!43'})).status,400);
+  const verified=await call('/auth/otp/verify','POST',{email:admin.email,otp:adminOtp});assert.equal(verified.status,200);
+  assert.equal((await call('/auth/otp/reset','POST',{recoveryToken:verified.body.recoveryToken,password:'AnotherPass!43'})).status,200);
   assert.equal((await call('/state','GET',null,cookie)).status,401);
-  assert.equal((await call('/auth/reset','POST',{token,password:'AnotherPass!44'})).status,400);
+  assert.equal((await call('/auth/otp/reset','POST',{recoveryToken:verified.body.recoveryToken,password:'AnotherPass!44'})).status,400);
   assert.equal((await call('/auth/login','POST',admin)).status,401);
   const newLogin=await call('/auth/login','POST',{...admin,password:'AnotherPass!43'});assert.equal(newLogin.status,200);
   assert.equal((await call('/auth/logout','POST',{},newLogin.cookie)).status,200);

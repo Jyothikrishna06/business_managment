@@ -49,8 +49,8 @@ When initialized on a fresh database, default credentials are:
 - **Multi-Role Access Control:** Separate portals and permissions for `admin`, `staff`, and `customer`.
 - **Registration & Validation:** Customer registration with strict password policies (more than 8 characters, at least one uppercase letter, one lowercase letter, and one special character).
 - **Secure Password Hashing:** Salted `scrypt` password hashing and secure HttpOnly cookie session management.
-- **Forgot Password & Recovery:** Automated reset links and 6-digit recovery verification codes with rate limiting and 30-minute expiry.
-- **Session Security:** Resetting a password immediately invalidates all active sessions. Instant session termination upon account deactivation.
+- **Forgot Password & Recovery:** A six-digit email OTP for every active role. Verify the code, choose a new password and sign in automatically. Codes expire after 10 minutes; verified reset proofs expire after 5 minutes. The recovery-method dropdown is removed.
+- **Session Security:** Resetting a password immediately invalidates all previous sessions and recovery credentials, then creates one new sign-in session. Instant session termination upon account deactivation.
 
 ### 2. Role-Based Portals (RBAC)
 - **Admin Control Center:**
@@ -203,7 +203,7 @@ SMTP_PASS=password
 MAIL_FROM="Brightloop Software <no-reply@brightloop.com>"
 APP_URL=http://localhost:3000
 
-# Local Testing (prints reset & recovery links to console if SMTP is not configured)
+# Local Testing (prints recovery OTPs to console if SMTP is not configured)
 DEV_RESET_LINKS=true
 ```
 
@@ -232,3 +232,12 @@ DEV_RESET_LINKS=true
 ## 📄 License
 
 This project is licensed under the MIT License.
+
+
+## Gmail OTP delivery
+
+For Gmail or Google Workspace, use `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587`, your full sending address as `SMTP_USER`, and a Google app password as `SMTP_PASS`. Set `MAIL_FROM` to the same sender and start with `npm start` so the ignored `.env` is loaded. Port 587 requires STARTTLS; the recovery sender enforces TLS and connection timeouts. Sender credentials belong only in the ignored local .env file.
+
+Google requires 2-Step Verification to create an app password; some Workspace policies or account protection settings may disable app passwords. Create one at https://myaccount.google.com/apppasswords and enter it locally in `.env`, never in chat or Git. Restart the server after editing `.env`. If app passwords are unavailable, the Workspace administrator must allow a supported mail configuration; do not disable account protections.
+
+Forgot password is **email → OTP → new password → signed-in workspace**. Unknown or deactivated addresses receive the same generic response without a code being sent. A successful password change revokes old sessions, OTPs and reset proofs. Failed delivery never moves the user to a screen claiming an email was sent. Previously issued legacy reset links remain accepted until their original expiry, but new recovery requests send OTPs only.
