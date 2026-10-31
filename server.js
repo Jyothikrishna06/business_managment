@@ -2,7 +2,7 @@ import {createSoftwarePortal} from './software-server.js';
 import {createExcelReport,reportSchema} from './excel-report.js';
 import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
-import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
+import { randomBytes, randomInt, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { extname, resolve, sep } from 'node:path';
@@ -11,8 +11,8 @@ import nodemailer from 'nodemailer';
 const root = fileURLToPath(new URL('.', import.meta.url));
 mkdirSync(process.env.DATA_DIR || `${root}data`, { recursive: true });
 const db = new DatabaseSync(`${process.env.DATA_DIR || `${root}data`}/subscript.db`);
-db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT,email TEXT UNIQUE,password TEXT,role TEXT,status TEXT DEFAULT 'active'); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS resets(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS records(id TEXT PRIMARY KEY,type TEXT,body TEXT); CREATE INDEX IF NOT EXISTS records_type_idx ON records(type); CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,time TEXT,userId TEXT,action TEXT); CREATE TABLE IF NOT EXISTS notifications(id TEXT PRIMARY KEY,userId TEXT,title TEXT,message TEXT,type TEXT,referenceId TEXT,createdAt TEXT,readAt TEXT,UNIQUE(userId,type,referenceId)); CREATE INDEX IF NOT EXISTS notifications_user_idx ON notifications(userId,createdAt DESC); CREATE TABLE IF NOT EXISTS expiry_notices(id TEXT PRIMARY KEY,subscriptionId TEXT,stage TEXT,sentAt TEXT,UNIQUE(subscriptionId,stage));`);
-try{db.exec(`ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'`);}catch{/* column may already exist */}
+db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT,email TEXT UNIQUE,password TEXT,role TEXT,status TEXT DEFAULT 'active'); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS resets(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS records(id TEXT PRIMARY KEY,type TEXT,body TEXT); CREATE INDEX IF NOT EXISTS records_type_idx ON records(type); CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,time TEXT,userId TEXT,action TEXT); CREATE TABLE IF NOT EXISTS notifications(id TEXT PRIMARY KEY,userId TEXT,title TEXT,message TEXT,type TEXT,referenceId TEXT,createdAt TEXT,readAt TEXT,UNIQUE(userId,type,referenceId)); CREATE INDEX IF NOT EXISTS notifications_user_idx ON notifications(userId,createdAt DESC); CREATE TABLE IF NOT EXISTS expiry_notices(id TEXT PRIMARY KEY,subscriptionId TEXT,stage TEXT,sentAt TEXT,UNIQUE(subscriptionId,stage)); CREATE TABLE IF NOT EXISTS otps(email TEXT PRIMARY KEY,code_hash TEXT,expires INTEGER,attempts INTEGER DEFAULT 0,purpose TEXT);`);
+if(!db.prepare('PRAGMA table_info(users)').all().some(c=>c.name==='status'))db.exec("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'");
 const types = ['products','plans','customers','quotationTemplates','quotations','subscriptions','invoices','payments','discounts','taxes'];
 const hash = v => createHash('sha256').update(v).digest('hex');
 const uid = () => randomBytes(12).toString('hex');
@@ -32,21 +32,9 @@ function ensureBootstrapAdmin(){
   const email=(process.env.BOOTSTRAP_ADMIN_EMAIL||'make_a_ton@gmail.com').trim().toLowerCase();
   const password=process.env.BOOTSTRAP_ADMIN_PASSWORD||'makeaton123';
   const existing=db.prepare('SELECT id FROM users WHERE email=?').get(email);
-  if(!existing) db.prepare('INSERT INTO users VALUES(?,?,?,?,?,?)').run(uid(),'Make A Ton Admin',email,passwordHash(password),'admin','active');
-}
-function ensureBootstrapDefaults(){
-  if(process.env.DATA_DIR && process.env.DATA_DIR.includes('-test-')) return;
-  if(all('taxes').length===0){
-    const taxes=[{id:uid(),name:'GST 18% (Standard SaaS)',rate:18},{id:uid(),name:'GST 12% (IT Services)',rate:12},{id:uid(),name:'GST 5% (Concessional)',rate:5},{id:uid(),name:'Zero Tax (0% Export / Exempt)',rate:0}];
-    for(const t of taxes)put('taxes',t);
-  }
-  if(all('discounts').length===0){
-    const discounts=[{id:uid(),name:'Launch Offer 10%',kind:'Percentage',value:10,minQuantity:1},{id:uid(),name:'Festive Deal 20%',kind:'Percentage',value:20,minQuantity:1},{id:uid(),name:'Flat ₹100 Off',kind:'Fixed',value:100,minQuantity:1},{id:uid(),name:'Volume Tier ₹500 Off',kind:'Fixed',value:500,minQuantity:5}];
-    for(const d of discounts)put('discounts',d);
-  }
+  if(!existing) db.prepare('INSERT INTO users(id,name,email,password,role,status) VALUES(?,?,?,?,?,?)').run(uid(),'Make A Ton Admin',email,passwordHash(password),'admin','active');
 }
 ensureBootstrapAdmin();
-ensureBootstrapDefaults();
 const round=value=>Math.round(Number(value||0)*100)/100;
 function recordLines(record){
   const supplied=Array.isArray(record.lines)&&record.lines.length?record.lines:[{productId:record.productId,planId:record.planId,variantId:record.variantId,variantName:record.variantName,quantity:record.quantity,unitPrice:record.unitPrice,taxId:record.taxId,discountId:record.discountId}];
@@ -196,6 +184,34 @@ function validate(type,r){
     if(type==='subscriptions'&&!['Draft','Quotation','Confirmed','Active','Paused','Closed'].includes(r.status))fail('Invalid status.');
   }
 }
+/* --- OTP helpers (customer-only password flows) --- */
+const OTP_TTL = 600000; /* 10 minutes */
+const OTP_MAX_ATTEMPTS = 5;
+function generateOtp() { return String(randomInt(100000,1000000)); }
+async function sendOtpMail(toEmail, otp, purpose) {
+  const subject = purpose === 'reset' ? 'Your Brightloop password reset code' : 'Your Brightloop password change code';
+  const text = `Your verification code is: ${otp}\n\nIt expires in 10 minutes. Do not share it with anyone.\nIf you did not request this, ignore this email.`;
+  if (process.env.SMTP_HOST) {
+    await nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: process.env.SMTP_PORT === '465', auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined }).sendMail({ from: process.env.MAIL_FROM, to: toEmail, subject, text });
+  } else if(process.env.DEV_RESET_LINKS==='true') {
+    console.log(`[DEV] OTP for ${toEmail} (${purpose}): ${otp}`);
+  } else {fail('Email delivery is not configured. Contact your administrator.',503);}
+}
+function storeOtp(email, otp, purpose) {
+  db.prepare('INSERT OR REPLACE INTO otps(email,code_hash,expires,attempts,purpose) VALUES(?,?,?,0,?)').run(email, hash(otp), Date.now() + OTP_TTL, purpose);
+}
+function verifyOtp(email, code, purpose) {
+  const row = db.prepare('SELECT * FROM otps WHERE email=? AND purpose=?').get(email, purpose);
+  if (!row) fail('No OTP was requested for this email, or it has expired. Please request a new code.');
+  if (row.expires < Date.now()) { db.prepare('DELETE FROM otps WHERE email=?').run(email); fail('The code has expired. Please request a new code.'); }
+  if (row.attempts >= OTP_MAX_ATTEMPTS) { db.prepare('DELETE FROM otps WHERE email=?').run(email); fail('Too many incorrect attempts. Please request a new code.'); }
+  if (!timingSafeEqual(Buffer.from(hash(String(code)), 'hex'), Buffer.from(row.code_hash, 'hex'))) {
+    db.prepare('UPDATE otps SET attempts=attempts+1 WHERE email=?').run(email);
+    fail('The code is incorrect. Please check your email and try again.');
+  }
+  db.prepare('DELETE FROM otps WHERE email=?').run(email);
+}
+/* -------------------------------------------------- */
 const softwarePortal=createSoftwarePortal({all,put,uid,fail,audit,nextDate});
 const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http://localhost');const path=url.pathname;const send=(data,code=200,headers={})=>{res.writeHead(code,{'Content-Type':'application/json','Cache-Control':'no-store',...headers});res.end(JSON.stringify(data));};try{
   res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('X-Frame-Options','DENY');res.setHeader('Referrer-Policy','same-origin');
@@ -205,7 +221,7 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
   if(path==='/api/auth/register'&&req.method==='POST'){
     throttle(req.socket.remoteAddress);if(!b.name?.trim()||!/^\S+@\S+\.\S+$/.test(email))fail('Enter your name and a valid email.');if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');
     if(db.prepare('SELECT id FROM users WHERE email=?').get(email))fail('An account already exists with this email.');
-    const role='customer';const u={id:uid(),name:b.name.trim(),email,password:passwordHash(b.password),role};db.prepare('INSERT INTO users VALUES(?,?,?,?,?,?)').run(u.id,u.name,email,u.password,role,'active');put('customers',{id:uid(),name:u.name,email,userId:u.id});audit(u,'Customer account registered');return send({ok:true});
+    const role='customer';const u={id:uid(),name:b.name.trim(),email,password:passwordHash(b.password),role};db.prepare('INSERT INTO users(id,name,email,password,role,status) VALUES(?,?,?,?,?,?)').run(u.id,u.name,email,u.password,role,'active');put('customers',{id:uid(),name:u.name,email,userId:u.id});audit(u,'Customer account registered');return send({ok:true});
   }
   if(path==='/api/auth/login'&&req.method==='POST'){
     throttle(req.socket.remoteAddress);const u=db.prepare('SELECT * FROM users WHERE email=?').get(email);const [salt,saved]=(u?.password||`${uid()}:${'0'.repeat(128)}`).split(':');const computed=scryptSync(String(b.password||''),salt,64);if(!u||!timingSafeEqual(computed,Buffer.from(saved,'hex')))fail('Email or password is incorrect.',401);if(u.status==='deactivated')fail('This account has been deactivated. Contact your administrator.',403);
@@ -218,21 +234,63 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
     return send({message:'If an account exists, a password reset link has been requested. It expires in 30 minutes.'});
   }
   if(path==='/api/auth/reset'&&req.method==='POST'){
-    throttle(req.socket.remoteAddress);if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');const r=db.prepare('SELECT * FROM resets WHERE token=? AND expires>?').get(hash(String(b.token)),Date.now());if(!r)fail('This link is invalid or expired. Request a new reset link.');db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),r.userId);db.prepare('DELETE FROM resets WHERE userId=?').run(r.userId);db.prepare('DELETE FROM sessions WHERE userId=?').run(r.userId);return send({ok:true});
+    throttle(req.socket.remoteAddress);if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');const r=db.prepare('SELECT * FROM resets WHERE token=? AND expires>?').get(hash(String(b.token)),Date.now());if(!r)fail('This link is invalid or expired. Request a new reset link.');db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),r.userId);db.prepare('DELETE FROM resets WHERE userId=?').run(r.userId);db.prepare('DELETE FROM sessions WHERE userId=?').run(r.userId);const resetUser=db.prepare('SELECT email FROM users WHERE id=?').get(r.userId);if(resetUser)db.prepare('DELETE FROM otps WHERE email=?').run(resetUser.email);return send({ok:true});
   }
-  const token=(req.headers.cookie||'').split(';').map(c=>c.trim()).find(c=>c.startsWith('session='))?.slice(8);const session=token&&db.prepare('SELECT * FROM sessions WHERE token=? AND expires>?').get(hash(token),Date.now());const u=session&&db.prepare('SELECT * FROM users WHERE id=?').get(session.userId);if(!u)fail('Please sign in.',401);
+  
+  /* ---- OTP: send code for forgot-password (customers only) ---- */
+  if(path==='/api/auth/otp/send'&&req.method==='POST'){
+    throttle(req.socket.remoteAddress);
+    if(!email)fail('Enter your email address.');
+    const u=db.prepare('SELECT * FROM users WHERE email=?').get(email);
+    
+    if(!process.env.SMTP_HOST&&process.env.DEV_RESET_LINKS!=='true')fail('Email delivery is not configured. Contact your administrator.',503);
+    if(u?.role==='customer'){const otp=generateOtp();storeOtp(email,otp,'reset');try{await sendOtpMail(email,otp,'reset');}catch(error){db.prepare('DELETE FROM otps WHERE email=?').run(email);throw error;}}
+    return send({message:'If a customer account exists for that email, a 6-digit code has been sent. It expires in 10 minutes.'});
+  }
+  /* ---- OTP: verify code and set new password (forgot flow) ---- */
+  if(path==='/api/auth/otp/reset'&&req.method==='POST'){
+    throttle(req.socket.remoteAddress);
+    if(!email)fail('Enter your email address.');
+    if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');
+    const u=db.prepare('SELECT * FROM users WHERE email=?').get(email);
+    if(!u||u.role!=='customer')fail('The code is invalid or expired.');
+    verifyOtp(email,String(b.otp||''),'reset');
+    db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),u.id);
+    db.prepare('DELETE FROM sessions WHERE userId=?').run(u.id);db.prepare('DELETE FROM resets WHERE userId=?').run(u.id);
+    audit(u,'Customer reset password via OTP');
+    return send({ok:true});
+  }
+  const token=(req.headers.cookie||'').split(';').map(c=>c.trim()).find(c=>c.startsWith('session='))?.slice(8);const session=token&&db.prepare('SELECT * FROM sessions WHERE token=? AND expires>?').get(hash(token),Date.now());const u=session&&db.prepare('SELECT * FROM users WHERE id=?').get(session.userId);if(!u)fail('Please sign in.',401);if(u.status==='deactivated')fail('This account has been deactivated.',403);
   if(path==='/api/auth/me'&&req.method==='GET')return send({user:publicUser(u)});
+  /* ---- OTP: send code for change-password (logged-in customers only) ---- */
+  if(path==='/api/auth/otp/change/send'&&req.method==='POST'){
+    if(u.role!=='customer')fail('This action is available for customer accounts only.',403);
+    throttle(u.id);
+    if(!process.env.SMTP_HOST&&process.env.DEV_RESET_LINKS!=='true')fail('Email delivery is not configured. Contact your administrator.',503);const otp=generateOtp();storeOtp(u.email,otp,'change');try{await sendOtpMail(u.email,otp,'change');}catch(error){db.prepare('DELETE FROM otps WHERE email=?').run(u.email);throw error;}
+    return send({message:'A 6-digit code has been sent to your registered email. It expires in 10 minutes.'});
+  }
+  /* ---- OTP: verify code and update password (change flow) ---- */
+  if(path==='/api/auth/otp/change'&&req.method==='POST'){
+    if(u.role!=='customer')fail('This action is available for customer accounts only.',403);
+    throttle(u.id);
+    if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');
+    verifyOtp(u.email,String(b.otp||''),'change');
+    db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),u.id);
+    db.prepare('DELETE FROM sessions WHERE userId=? AND token<>?').run(u.id,hash(token));db.prepare('DELETE FROM resets WHERE userId=?').run(u.id);
+    audit(u,'Customer changed password via OTP');
+    return send({ok:true});
+  }
   if(path==='/api/auth/logout'&&req.method==='POST'){db.prepare('DELETE FROM sessions WHERE token=?').run(hash(token));return send({ok:true},200,{'Set-Cookie':'session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'});}
-  if(path==='/api/profile'&&req.method==='POST'){if(!b.name?.trim())fail('Name is required.');db.prepare('UPDATE users SET name=? WHERE id=?').run(b.name.trim(),u.id);const cust=all('customers').find(c=>c.userId===u.id||c.email===u.email);if(cust)put('customers',{...cust,name:b.name.trim()});audit(u,'Updated profile name');return send({user:{...publicUser(u),name:b.name.trim()}});}
+  if(path==='/api/profile'&&req.method==='POST'){if(!b.name?.trim())fail('Name is required.');db.prepare('UPDATE users SET name=? WHERE id=?').run(b.name.trim(),u.id);for(const cust of all('customers').filter(c=>c.userId===u.id))put('customers',{...cust,name:b.name.trim()});audit(u,'Updated profile name');return send({user:{...publicUser(u),name:b.name.trim()}});}
   if(path==='/api/notifications'&&req.method==='GET'){quotationAutomation();const items=db.prepare('SELECT id,title,message,type,referenceId,createdAt,readAt FROM notifications WHERE userId=? ORDER BY createdAt DESC LIMIT 30').all(u.id);return send({items,unread:items.filter(n=>!n.readAt).length});}
   if(path==='/api/notifications/all'&&req.method==='POST'){db.prepare('UPDATE notifications SET readAt=? WHERE userId=? AND readAt IS NULL').run(new Date().toISOString(),u.id);return send({ok:true});}
   const notificationMatch=path.match(/^\/api\/notifications\/([a-f0-9]+)\/read$/);if(notificationMatch&&req.method==='POST'){const item=db.prepare('SELECT id FROM notifications WHERE id=? AND userId=?').get(notificationMatch[1],u.id);if(!item)fail('Notification not found.',404);db.prepare('UPDATE notifications SET readAt=COALESCE(readAt,?) WHERE id=? AND userId=?').run(new Date().toISOString(),notificationMatch[1],u.id);return send({ok:true});}
-  if(path==='/api/state'&&req.method==='GET'){subscriptionAutomation();const data=Object.fromEntries(types.map(t=>[t,all(t)]));if(u.role==='customer'){data.catalog=softwarePortal.catalog();const ids=data.customers.filter(c=>c.userId===u.id).map(c=>c.id);for(const t of ['subscriptions','quotations','invoices'])data[t]=data[t].filter(r=>ids.includes(r.customerId));const invoices=data.invoices.map(i=>i.id);data.payments=data.payments.filter(p=>invoices.includes(p.invoiceId));data.customers=data.customers.filter(c=>ids.includes(c.id));const ownedProductIds=new Set(data.subscriptions.flatMap(s=>recordLines(s).map(line=>line.productId)));data.products=data.products.filter(p=>ownedProductIds.has(p.id)).map(({id,name,price,currency})=>({id,name,price,currency}));data.quotationTemplates=[];data.discounts=[];data.taxes=[];}return send(data);}
+  if(path==='/api/state'&&req.method==='GET'){subscriptionAutomation();const data=Object.fromEntries(types.map(t=>[t,all(t)]));if(u.role==='staff')data.products=data.products.map(({cost,...p})=>p);if(u.role==='customer'){data.demoCheckout=process.env.ENABLE_DEMO_CHECKOUT==='true';data.catalog=softwarePortal.catalog();const ids=data.customers.filter(c=>c.userId===u.id).map(c=>c.id);for(const t of ['subscriptions','quotations','invoices'])data[t]=data[t].filter(r=>ids.includes(r.customerId));const invoices=data.invoices.map(i=>i.id);data.payments=data.payments.filter(p=>invoices.includes(p.invoiceId));data.customers=data.customers.filter(c=>ids.includes(c.id));const ownedProductIds=new Set(data.subscriptions.flatMap(s=>recordLines(s).map(line=>line.productId)));data.products=data.products.filter(p=>ownedProductIds.has(p.id)).map(({id,name,price,currency})=>({id,name,price,currency}));data.quotationTemplates=[];data.discounts=[];data.taxes=[];}return send(data);}
   if(path.startsWith('/api/customer/'))return send(softwarePortal.handle(u,path,req.method,b));
   if(u.role==='customer')fail('You do not have permission to perform this action.',403);
   if(path==='/api/reports/schema'&&req.method==='GET')return send(reportSchema());
   if(path==='/api/reports/xlsx'&&req.method==='POST'){
-    const records=Object.fromEntries(types.map(type=>[type,all(type)]));
+    const records=Object.fromEntries(types.map(type=>[type,all(type)]));if(u.role==='staff')records.products=records.products.map(({cost,...p})=>p);
     const report=await createExcelReport(b,records,publicUser(u));
     audit(u,`Exported ${b.dataset} report with ${report.count} records`);
     res.writeHead(200,{'Content-Type':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet','Content-Disposition':`attachment; filename="${report.filename}"`,'Content-Length':report.buffer.length,'Cache-Control':'no-store','X-Report-Count':String(report.count)});
@@ -247,7 +305,7 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
   if(staffMatch&&req.method==='POST'){if(u.role!=='admin')fail('Administrator access required.',403);const [,userType,staffId,staffAction]=staffMatch;const target=db.prepare('SELECT * FROM users WHERE id=?').get(staffId);if(!target||(userType==='staff'&&!['staff','admin'].includes(target.role)))fail('User not found.',404);
     if(staffAction==='deactivate'){if(target.id===u.id)fail('You cannot deactivate your own account.');db.prepare("UPDATE users SET status='deactivated' WHERE id=?").run(staffId);db.prepare('DELETE FROM sessions WHERE userId=?').run(staffId);audit(u,`Deactivated ${target.email}`);return send({ok:true});}
     if(staffAction==='activate'){db.prepare("UPDATE users SET status='active' WHERE id=?").run(staffId);audit(u,`Reactivated ${target.email}`);return send({ok:true});}
-    if(staffAction==='reset'){if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),staffId);db.prepare('DELETE FROM sessions WHERE userId=?').run(staffId);audit(u,`Reset password for ${target.email}`);return send({ok:true});}
+    if(staffAction==='reset'){if(!validPassword(b.password))fail('Use more than 8 characters with uppercase, lowercase and a special character.');db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),staffId);db.prepare('DELETE FROM sessions WHERE userId=?').run(staffId);db.prepare('DELETE FROM resets WHERE userId=?').run(staffId);db.prepare('DELETE FROM otps WHERE email=?').run(target.email);audit(u,`Reset password for ${target.email}`);return send({ok:true});}
     if(!b.name?.trim())fail('Name is required.');if(b.email){const trimmed=b.email.trim().toLowerCase();if(trimmed!==target.email){if(db.prepare('SELECT id FROM users WHERE email=?').get(trimmed))fail('Email already registered.');}db.prepare('UPDATE users SET name=?,email=? WHERE id=?').run(b.name.trim(),trimmed,staffId);}else{db.prepare('UPDATE users SET name=? WHERE id=?').run(b.name.trim(),staffId);}audit(u,`Updated user ${target.email}`);return send({ok:true});
   }
   if(path==='/api/invoice-action'&&req.method==='POST'){
@@ -262,15 +320,15 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
     const s={...q,id:uid(),number:`SUB-${uid().slice(0,8).toUpperCase()}`,status:'Confirmed',ends:'',nextBilling:q.starts};validate('subscriptions',s);db.exec('BEGIN IMMEDIATE');try{put('subscriptions',s);put('quotations',{...q,status:'Confirmed',subscriptionId:s.id});db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}notifyQuotation(q,'converted');audit(u,'Converted quotation');return send(s);
   }
   if(path==='/api/billing'&&req.method==='POST'){const count=bill();audit(u,`Generated ${count} invoices`);return send({count});}
-  if(path==='/api/staff'&&req.method==='POST'){if(u.role!=='admin')fail('Administrator access required.',403);if(!validPassword(b.password)||!/^\S+@\S+\.\S+$/.test(email)||!b.name?.trim())fail('Enter a name, valid email and a strong password.');if(db.prepare('SELECT id FROM users WHERE email=?').get(email))fail('Email already registered.');db.prepare('INSERT INTO users VALUES(?,?,?,?,?,?)').run(uid(),b.name.trim(),email,passwordHash(b.password),'staff','active');audit(u,'Staff account created');return send({ok:true});}
-  const listMatch=path.match(/^\/api\/records\/([A-Za-z]+)$/);if(listMatch&&req.method==='GET'&&types.includes(listMatch[1])){const page=Math.max(1,Number(url.searchParams.get('page')||1)),limit=Math.min(200,Math.max(1,Number(url.searchParams.get('limit')||50))),offset=(page-1)*limit,total=db.prepare('SELECT COUNT(*) AS count FROM records WHERE type=?').get(listMatch[1]).count,items=db.prepare('SELECT body FROM records WHERE type=? ORDER BY rowid DESC LIMIT ? OFFSET ?').all(listMatch[1],limit,offset).map(row=>JSON.parse(row.body));return send({items,page,limit,total,pages:Math.ceil(total/limit)});}
+  if(path==='/api/staff'&&req.method==='POST'){if(u.role!=='admin')fail('Administrator access required.',403);if(!validPassword(b.password)||!/^\S+@\S+\.\S+$/.test(email)||!b.name?.trim())fail('Enter a name, valid email and a strong password.');if(db.prepare('SELECT id FROM users WHERE email=?').get(email))fail('Email already registered.');db.prepare('INSERT INTO users(id,name,email,password,role,status) VALUES(?,?,?,?,?,?)').run(uid(),b.name.trim(),email,passwordHash(b.password),'staff','active');audit(u,'Staff account created');return send({ok:true});}
+  const listMatch=path.match(/^\/api\/records\/([A-Za-z]+)$/);if(listMatch&&req.method==='GET'&&types.includes(listMatch[1])){const page=Math.max(1,Number(url.searchParams.get('page')||1)),limit=Math.min(200,Math.max(1,Number(url.searchParams.get('limit')||50))),offset=(page-1)*limit,total=db.prepare('SELECT COUNT(*) AS count FROM records WHERE type=?').get(listMatch[1]).count,items=db.prepare('SELECT body FROM records WHERE type=? ORDER BY rowid DESC LIMIT ? OFFSET ?').all(listMatch[1],limit,offset).map(row=>JSON.parse(row.body));if(!Number.isInteger(page)||!Number.isInteger(limit))fail('Use whole page and limit values.');return send({items:u.role==='staff'&&listMatch[1]==='products'?items.map(({cost,...p})=>p):items,page,limit,total,pages:Math.ceil(total/limit)});}
   const match=path.match(/^\/api\/records\/([A-Za-z]+)(?:\/([a-f0-9]+))?$/);if(!match||!types.includes(match[1]))fail('Not found',404);const [,type,id]=match;if(['products','plans','discounts','taxes'].includes(type)&&u.role!=='admin')fail('Administrator access required.',403);
   if(req.method==='POST'||req.method==='PATCH'){
     const old=id?all(type).find(r=>r.id===id):undefined;if(id&&!old)fail('Record not found.',404);let r={...old,...b,id:id||uid()};delete r.password;
     if(type==='invoices')fail('Invoices are generated from subscriptions. Use invoice actions.');
     if(type==='subscriptions'&&old&&all('invoices').some(i=>i.subscriptionId===id)&&['starts','customerId','productId','planId','quantity','unitPrice','lines'].some(key=>b[key]!==undefined&&JSON.stringify(b[key])!==JSON.stringify(old[key])))fail('Billed contract details cannot be changed. Create a new subscription for pricing changes.');
-    if(type==='payments'){if(id)fail('Payments cannot be edited.');validate(type,r);const i=all('invoices').find(i=>i.id===r.invoiceId);if(!i||i.status!=='Confirmed')fail('Choose a confirmed unpaid invoice.');const paid=all('payments').filter(p=>p.invoiceId===i.id).reduce((s,p)=>s+Number(p.amount),0);if(!(Number(r.amount)>0)||Number(r.amount)>i.total-paid+0.001)fail('Amount exceeds the outstanding balance or is invalid.');if(!r.date||!['Bank transfer','Card','Cash','Other'].includes(r.method))fail('Payment date and method are required.');db.exec('BEGIN IMMEDIATE');try{put(type,r);put('invoices',{...i,status:paid+Number(r.amount)>=i.total-0.001?'Paid':'Confirmed'});db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}}
-    else {validate(type,r);if(type==='subscriptions'){assertSubscriptionTransition(old?.status,r.status);if(old&&all('invoices').some(i=>i.subscriptionId===id)&&['starts','customerId','lines'].some(k=>JSON.stringify(old[k])!==JSON.stringify(r[k])))fail('Billed contract details cannot be changed. Create a new subscription for pricing changes.');if(old&&old.status==='Paused'&&r.status==='Active'){let due=r.nextBilling||r.starts;const today=new Date().toISOString().slice(0,10);while(due<today)due=nextDate(due,r.cycle||'Monthly',Number(r.starts.slice(8,10)));r.nextBilling=due;}else{r.nextBilling=old?.nextBilling||r.starts;}}if(type==='customers'){const account=db.prepare('SELECT id FROM users WHERE email=? AND role=?').get(r.email,'customer');r.userId=account?.id||null;}if(type==='quotations'&&old?.subscriptionId)r.subscriptionId=old.subscriptionId;if(type==='discounts')r.used=old?.used||0;put(type,r);if(type==='quotations'&&!id)notifyQuotation(r,'created');}audit(u,`${id?'Updated':'Created'} ${type}: ${r.id}`);return send(r);
+    if(type==='payments'){if(Math.abs(Number(r.amount)*100-Math.round(Number(r.amount)*100))>0.00001)fail('Use at most two decimal places for a payment.');if(r.date>new Date().toISOString().slice(0,10))fail('Payment date cannot be in the future.');if(id)fail('Payments cannot be edited.');validate(type,r);const i=all('invoices').find(i=>i.id===r.invoiceId);if(!i||i.status!=='Confirmed')fail('Choose a confirmed unpaid invoice.');const paid=all('payments').filter(p=>p.invoiceId===i.id).reduce((s,p)=>s+Number(p.amount),0);if(!(Number(r.amount)>0)||Number(r.amount)>i.total-paid+0.001)fail('Amount exceeds the outstanding balance or is invalid.');if(!r.date||!['Bank transfer','Card','Cash','Other'].includes(r.method))fail('Payment date and method are required.');db.exec('BEGIN IMMEDIATE');try{put(type,r);put('invoices',{...i,status:paid+Number(r.amount)>=i.total-0.001?'Paid':'Confirmed'});db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}}
+    else {validate(type,r);if(type==='subscriptions'){assertSubscriptionTransition(old?.status,r.status);if(old&&all('invoices').some(i=>i.subscriptionId===id)&&['starts','customerId','lines'].some(k=>JSON.stringify(old[k])!==JSON.stringify(r[k])))fail('Billed contract details cannot be changed. Create a new subscription for pricing changes.');if(old&&old.status==='Paused'&&r.status==='Active'){let due=r.nextBilling||r.starts;const today=new Date().toISOString().slice(0,10);while(due<today)due=nextDate(due,r.cycle||'Monthly',Number(r.starts.slice(8,10)));r.nextBilling=due;}else{r.nextBilling=old?.nextBilling||r.starts;}}if(type==='customers'&&u.role==='staff'){r.userId=old?.userId||null;}else if(type==='customers'){const account=db.prepare('SELECT id FROM users WHERE email=? AND role=?').get(r.email,'customer');r.userId=account?.id||null;}if(type==='quotations'&&old?.subscriptionId)r.subscriptionId=old.subscriptionId;if(type==='discounts')r.used=old?.used||0;put(type,r);if(type==='quotations'&&!id)notifyQuotation(r,'created');}audit(u,`${id?'Updated':'Created'} ${type}: ${r.id}`);return send(r);
   }
   if(req.method==='DELETE'){if(['payments','invoices','subscriptions'].includes(type))fail('Financial records are retained. Close or cancel them instead.');const references={customers:['customerId'],products:['productId'],plans:['planId'],discounts:['discountId'],taxes:['taxId']};if(types.some(t=>all(t).some(r=>(references[type]||[]).some(key=>r[key]===id))))fail('This record is in use and cannot be deleted.');db.prepare('DELETE FROM records WHERE id=? AND type=?').run(id,type);audit(u,`Deleted ${type}: ${id}`);return send({ok:true});}
   fail('Method not allowed',405);
