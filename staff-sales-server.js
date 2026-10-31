@@ -10,8 +10,9 @@ export function createStaffSales({all,put,uid,fail,assignedCustomer,audit,calcul
     if(!Array.isArray(lines)||!lines.length||lines.length>20)fail('Add between 1 and 20 order lines.');
     return lines.map(line=>{
       const p=all('products').find(p=>p.id===line.productId);
-      if(!p||!Number.isFinite(Number(p.price))||Number(p.price)<0)fail('Choose an available catalog product.');
+      if(!p||p.price===null||p.price===''||!Number.isFinite(Number(p.price))||Number(p.price)<0)fail('Choose an available catalog product.');
       if(!Number.isInteger(Number(line.quantity))||Number(line.quantity)<1||Number(line.quantity)>100000)fail('Enter a whole quantity between 1 and 100000.');
+      if(p.kind==='band'&&line.charge!=='Once'||p.kind==='monitoring'&&line.charge!=='Recurring')fail('Band purchases are one-time; monitoring services are recurring.');
       if(!['Once','Recurring'].includes(line.charge))fail('Choose one-time purchase or recurring monitoring.');
       return {productId:p.id,name:p.name,quantity:Number(line.quantity),unitPrice:Number(p.price),charge:line.charge};
     });
@@ -20,7 +21,7 @@ export function createStaffSales({all,put,uid,fail,assignedCustomer,audit,calcul
     const ids=new Set(all('customers').filter(c=>c.assignedStaffId===u.id).map(c=>c.id));
     const invoices=all('invoices').filter(i=>ids.has(i.customerId));
     return {
-      catalog:all('products').map(({id,name,price,notes})=>({id,name,price,notes})),
+      catalog:all('products').map(({id,name,price,notes,kind,brand,modelKey,planId,tier,features,description,specifications,colors,wellnessNotice})=>({id,name,price,notes,kind,brand,modelKey,planId,tier,features,description,specifications,colors,wellnessNotice})),
       plans:all('plans'),taxes:all('taxes'),discounts:all('discounts'),
       contracts:all('subscriptions').filter(s=>s.staffSale&&ids.has(s.customerId)).map(s=>({...s,preview:s.quoteTotals||calculate(s,s.starts)})),
       invoices:invoices.map(i=>({...i,balance:balance(i)})),
@@ -42,6 +43,8 @@ export function createStaffSales({all,put,uid,fail,assignedCustomer,audit,calcul
       if(ends&&ends<starts)fail('Expiry must follow the start date.');
       if(plan.starts&&starts<plan.starts||plan.ends&&starts>plan.ends)fail('The plan is unavailable on this date.');
       const lines=lineItems(b.lines),recurring=lines.filter(l=>l.charge==='Recurring');
+      for(const line of lines){const p=all('products').find(p=>p.id===line.productId);if(p.planId&&p.planId!==plan.id||plan.modelKey&&p.modelKey!==plan.modelKey)fail('Choose products and monitoring service that match the selected Aira model and plan.');}
+      if(plan.monitoringProductId&&(recurring.length!==1||recurring[0].productId!==plan.monitoringProductId))fail('This Aira plan requires its matching monitoring service.');
       if(!recurring.length)fail('Add a recurring health-monitoring service line.');
       if(recurring.some(l=>l.quantity<Number(plan.minQuantity||1)))fail('Monitoring quantity is below the plan minimum.');
       if(b.taxId&&!all('taxes').some(t=>t.id===b.taxId))fail('Choose an approved tax rule.');

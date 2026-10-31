@@ -1,0 +1,40 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {DatabaseSync} from 'node:sqlite';
+import {mkdtempSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {once} from 'node:events';
+import {seedAira} from '../scripts/seed-aira-demo.js';
+import {airaModels,levels} from '../aira-catalog.js';
+
+test('Aira catalog, idempotent 20-customer distribution and model-specific sales validation',async t=>{
+ const dir=mkdtempSync(join(tmpdir(),'aira-catalog-'));
+ Object.assign(process.env,{PORT:'0',DATA_DIR:dir,BOOTSTRAP_ADMIN_EMAIL:'admin@example.test',BOOTSTRAP_ADMIN_PASSWORD:'AdminPass42'});
+ const {server}=await import('../server.js');if(!server.listening)await once(server,'listening');
+ t.after(async()=>{await new Promise(r=>server.close(r));rmSync(dir,{recursive:true,force:true});});
+ const base=`http://127.0.0.1:${server.address().port}/api`;
+ const call=async(path,method='GET',body,cookie)=>{const r=await fetch(base+path,{method,headers:{'content-type':'application/json',...(cookie?{cookie}:{})},body:body?JSON.stringify(body):undefined});return {status:r.status,body:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]};};
+ const admin=(await call('/auth/login','POST',{email:'admin@example.test',password:'AdminPass42'})).cookie;
+ for(const [name,email] of [['First','first@example.test'],['Second','second@example.test']])await call('/staff','POST',{name,email,password:'StaffPass42'},admin);
+ const db=new DatabaseSync(join(dir,'subscript.db'));
+ const first=seedAira(db);assert.equal(first.created,20);assert.equal(first.totalCustomers,20);
+ assert.deepEqual(first.models.map(m=>m.customers),[4,4,4,4,4]);assert.equal(first.plans.length,15);assert.ok(first.plans.every(p=>p.customers>=1));assert.deepEqual(first.staff.map(s=>s.customers),[10,10]);
+ const before=db.prepare("SELECT body FROM records WHERE type='customers' ORDER BY id").all();
+ const repeat=seedAira(db);assert.equal(repeat.created,0);assert.equal(repeat.totalCustomers,20);
+ assert.deepEqual(db.prepare("SELECT body FROM records WHERE type='customers' ORDER BY id").all(),before,'Repeat seeding must preserve assignments and names');db.close();
+ const login=await call('/auth/login','POST',{email:'first@example.test',password:'StaffPass42'}),staff=login.cookie;
+ const state=(await call('/state','GET',null,staff)).body,sales=state.sales;
+ assert.equal(state.customers.length,10);assert.equal(sales.contracts.length,10);assert.equal(sales.plans.length,15);assert.equal(sales.catalog.filter(p=>p.kind==='band').length,5);assert.equal(sales.catalog.filter(p=>p.kind==='monitoring').length,15);
+ assert.ok(sales.catalog.every(p=>!('cost' in p)));assert.ok(sales.catalog.filter(p=>p.kind==='band').every(p=>p.price===null));
+ for(const model of airaModels){const product=sales.catalog.find(p=>p.kind==='band'&&p.modelKey===model.key);assert.deepEqual(product.specifications,model.specifications);model.plans.forEach((expected,index)=>{const plan=sales.plans.find(p=>p.name===expected.name);assert.equal(plan.price,expected.price);assert.equal(plan.tier,levels[index]);assert.deepEqual(plan.features,expected.features);assert.equal(plan.cycle,'Monthly');});}
+ assert.match(sales.catalog.find(p=>p.modelKey==='pulse'&&p.kind==='band').wellnessNotice,/wellness/);
+ const plan=sales.plans.find(p=>p.name==='Lite Basic'),wrong=sales.plans.find(p=>p.name==='Pulse Monitor'),band=sales.catalog.find(p=>p.kind==='band'&&p.modelKey==='lite');
+ const body={customerId:state.customers[0].id,planId:plan.id,starts:new Date().toISOString().slice(0,10),terms:'Net 15',validDays:15,lines:[{productId:plan.monitoringProductId,quantity:1,charge:'Recurring'}]};
+ let result=await call('/staff/sales/contracts','POST',body,staff);assert.equal(result.status,200);assert.equal(result.body.quoteTotals.total,2.99);
+ result=await call('/staff/sales/contracts','POST',{...body,lines:[{productId:wrong.monitoringProductId,quantity:1,charge:'Recurring'}]},staff);assert.equal(result.status,400);
+ result=await call('/staff/sales/contracts','POST',{...body,lines:[...body.lines,{productId:band.id,quantity:1,charge:'Once'}]},staff);assert.equal(result.status,400,'Unset hardware price must not become a free band');
+ await call('/records/products/'+band.id,'PATCH',{price:149},admin);
+ result=await call('/staff/sales/contracts','POST',{...body,lines:[...body.lines,{productId:band.id,quantity:1,charge:'Once'}]},staff);assert.equal(result.status,200);assert.equal(result.body.quoteTotals.total,151.99);
+ result=await call('/staff/sales/contracts','POST',{...body,lines:[{productId:plan.monitoringProductId,quantity:1,charge:'Once'}]},staff);assert.equal(result.status,400,'Monitoring plans cannot be sold as one-time charges');
+});
