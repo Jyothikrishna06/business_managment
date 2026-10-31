@@ -1,34 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {spawn} from 'node:child_process';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join,resolve,sep} from 'node:path';
 import {once} from 'node:events';
 
 test('admin portal: login, staff management, customer accounts, summaries, rbac', async t => {
+ Object.assign(process.env,{BOOTSTRAP_ADMIN_EMAIL:'make_a_ton@gmail.com',BOOTSTRAP_ADMIN_PASSWORD:'makeaton123',DEV_RESET_LINKS:'false',SMTP_HOST:'',ENABLE_DEMO_CHECKOUT:'false'});
   const dir = mkdtempSync(join(tmpdir(), 'subscript-admin-test-'));
   const port = 14000 + Math.floor(Math.random() * 10000);
-  const child = spawn(process.execPath, ['server.js'], {
-    cwd: process.cwd(),
-    env: {...process.env, PORT: String(port), APP_URL: `http://localhost:${port}`, DATA_DIR: dir, DEV_RESET_LINKS: 'true', SMTP_HOST: ''},
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-  let output = '';
-  child.stdout.on('data', d => output += d);
-  child.stderr.on('data', d => output += d);
-
-  t.after(async () => {
-    child.kill();
-    if (child.exitCode === null) await once(child, 'exit');
-    const p = resolve(dir);
-    if (p.startsWith(resolve(tmpdir()) + sep) && p.includes('subscript-admin-test-')) {
-      rmSync(p, {recursive: true, force: true});
-    }
-  });
-
-  for (let n = 0; n < 100 && !output.includes('running at'); n++) await new Promise(r => setTimeout(r, 50));
-  assert.match(output, /running at/);
+  Object.assign(process.env,{PORT:String(port),APP_URL:`http://localhost:${port}`,DATA_DIR:dir,DEV_RESET_LINKS:'true',SMTP_HOST:''});
+  const {server}=await import('../server.js?suite=admin-portal.test');if(!server.listening)await once(server,'listening');
+  t.after(async()=>{await new Promise(done=>server.close(done));rmSync(dir,{recursive:true,force:true});});
 
   const call = async (path, method = 'GET', body, cookie) => {
     const r = await fetch(`http://127.0.0.1:${port}/api${path}`, {
@@ -48,7 +31,7 @@ test('admin portal: login, staff management, customer accounts, summaries, rbac'
   const adminCookie = adminLogin.cookie;
 
   // 2. Admin dashboard stats summary
-  let stats = await call('/admin/stats', 'GET', null, adminCookie);
+  let stats = await call('/admin/stats?currency=USD', 'GET', null, adminCookie);
   assert.equal(stats.status, 200);
   assert.equal(typeof stats.body.mrr, 'number');
   assert.equal(typeof stats.body.totalRevenue, 'number');
@@ -155,9 +138,12 @@ test('admin portal: login, staff management, customer accounts, summaries, rbac'
   assert.equal(billResult.body.count, 1);
 
   // Verify updated admin stats reflect new subscription and billing
-  stats = await call('/admin/stats', 'GET', null, adminCookie);
+  stats = await call('/admin/stats?currency=USD', 'GET', null, adminCookie);
   assert.equal(stats.status, 200);
   assert.ok(stats.body.totalSubscriptions >= 1);
   assert.ok(stats.body.totalInvoices >= 1);
-  assert.ok(stats.body.owed > 0);
+  assert.equal(stats.body.owed,0,'Draft invoices are not issued receivables');
+  const invoice=(await call('/state','GET',null,adminCookie)).body.invoices.find(i=>i.subscriptionId===sub.id);
+  assert.equal((await call('/invoice-action','POST',{id:invoice.id,action:'confirm'},adminCookie)).status,200);
+  assert.ok((await call('/admin/stats?currency=USD','GET',null,adminCookie)).body.owed>0);
 });

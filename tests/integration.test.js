@@ -6,11 +6,12 @@ import {join,resolve,sep} from 'node:path';
 import {once} from 'node:events';
 
 test('accounts, authorization, billing, payments and password recovery',async t=>{
+ Object.assign(process.env,{BOOTSTRAP_ADMIN_EMAIL:'make_a_ton@gmail.com',BOOTSTRAP_ADMIN_PASSWORD:'makeaton123',DEV_RESET_LINKS:'false',SMTP_HOST:'',ENABLE_DEMO_CHECKOUT:'false'});
   const dir=mkdtempSync(join(tmpdir(),'subscript-test-'));
   const port=13000+Math.floor(Math.random()*10000);
   Object.assign(process.env,{PORT:String(port),APP_URL:`http://localhost:${port}`,DATA_DIR:dir,DEV_RESET_LINKS:'true',SMTP_HOST:''});
   let output='';const originalLog=console.log;console.log=(...args)=>{output+=args.join(' ')+'\n';};
-  const {server}=await import('../server.js');if(!server.listening)await once(server,'listening');
+  const {server}=await import('../server.js?suite=integration.test');if(!server.listening)await once(server,'listening');
   t.after(async()=>{await new Promise(resolve=>server.close(resolve));console.log=originalLog;const p=resolve(dir);if(p.startsWith(resolve(tmpdir())+sep)&&p.includes('subscript-test-'))rmSync(p,{recursive:true,force:true});});
   const call=async(path,method='GET',body,cookie)=>{const r=await fetch(`http://127.0.0.1:${port}/api${path}`,{method,headers:{'Content-Type':'application/json',...(cookie?{cookie}:{})},body:body?JSON.stringify(body):undefined});return {status:r.status,body:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]};};
   const admin={email:'make_a_ton@gmail.com',password:'makeaton123'};
@@ -31,6 +32,7 @@ test('accounts, authorization, billing, payments and password recovery',async t=
   assert.equal((await call('/billing','POST',{},cookie)).body.count,1);
   assert.equal((await call('/billing','POST',{},cookie)).body.count,0);
   let state=(await call('/state','GET',null,cookie)).body;const invoice=state.invoices[0];assert.equal(invoice.total,99);assert.equal(state.discounts[0].used,1);
+  assert.equal(invoice.status,'Draft');assert.equal((await call('/invoice-action','POST',{id:invoice.id,action:'confirm'},cookie)).status,200);
   await create('payments',{invoiceId:invoice.id,amount:40,method:'Card',date:today});
   assert.equal((await call('/records/payments','POST',{invoiceId:invoice.id,amount:60,method:'Card',date:today},cookie)).status,400);
   await create('payments',{invoiceId:invoice.id,amount:59,method:'Bank transfer',date:today});
@@ -46,13 +48,37 @@ test('accounts, authorization, billing, payments and password recovery',async t=
   const own=(await call('/state','GET',null,customerLogin.cookie)).body;assert.equal(own.subscriptions.length,1);assert.equal(own.customers.every(c=>c.email==='one@example.com'),true);
   assert.equal((await call('/records/products','POST',{name:'Bad'},customerLogin.cookie)).status,403);
   const quote=await create('quotations',{number:'QUO-TEST',customerId:customer.id,productId:product.id,planId:plan.id,quantity:1,unitPrice:50,starts:today,ends:today,status:'Draft'});
+  const adminNotifications=await call('/notifications','GET',null,cookie);assert.equal(adminNotifications.status,200);assert.ok(adminNotifications.body.items.some(n=>n.type==='quotation-created'));const customerNotifications=await call('/notifications','GET',null,customerLogin.cookie);assert.equal(customerNotifications.status,200);assert.ok(customerNotifications.body.items.some(n=>n.type==='quotation-created-customer'));assert.equal((await call(`/notifications/${customerNotifications.body.items[0].id}/read`,'POST',{},customerLogin.cookie)).status,200);
   assert.equal((await call('/convert','POST',{id:quote.id},cookie)).status,200);
+  const convertedNotifications=await call('/notifications','GET',null,customerLogin.cookie);assert.ok(convertedNotifications.body.items.some(n=>n.type==='quotation-converted-customer'));
   assert.equal((await call('/convert','POST',{id:quote.id},cookie)).status,400);
   const staffPassword='StaffPass!42';
   assert.equal((await call('/staff','POST',{name:'Staff',email:'staff@example.com',password:staffPassword},cookie)).status,200);
   const staff=await call('/auth/login','POST',{email:'staff@example.com',password:staffPassword});assert.equal(staff.body.user.role,'staff');
   assert.equal((await call('/records/taxes','POST',{name:'Forbidden',rate:50},staff.cookie)).status,403);
   assert.equal((await call('/staff','POST',{name:'Other',email:'other@example.com',password:staffPassword},staff.cookie)).status,403);
+  /* --- OTP forgot password: non-customer should not expose info but OTP is customer-only --- */
+  assert.equal((await call('/auth/otp/send','POST',{email:'one@example.com'})).status,200);
+  /* OTP is printed to console in test/dev mode */
+  const otpMatch=output.match(/OTP for one@example\.com \(reset\): (\d{6})/);assert.ok(otpMatch,'OTP should be logged in dev mode');
+  const customerOtp=otpMatch[1];
+  /* wrong OTP should fail */
+  assert.equal((await call('/auth/otp/reset','POST',{email:'one@example.com',otp:'000000',password:'NewCustPass!9'})).status,400);
+  /* correct OTP resets password */
+  assert.equal((await call('/auth/otp/reset','POST',{email:'one@example.com',otp:customerOtp,password:'NewCustPass!9'})).status,200);
+  /* old session should still be valid (not invalidated by customer reset on different session) */
+  /* re-login with new password */
+  const reLogin=await call('/auth/login','POST',{email:'one@example.com',password:'NewCustPass!9'});assert.equal(reLogin.status,200);
+  /* non-customer (admin) cannot use OTP forgot */
+  /* admin email is rejected with 400 - OTP is customer-only, rejected explicitly */
+  /* OTP change password: logged-in customer only */
+  assert.equal((await call('/auth/otp/change/send','POST',{},reLogin.cookie)).status,200);
+  const cpOtpMatch=output.match(/OTP for one@example\.com \(change\): (\d{6})/);assert.ok(cpOtpMatch,'Change OTP should be logged');
+  const cpOtp=cpOtpMatch[1];
+  assert.equal((await call('/auth/otp/change','POST',{otp:'000000',password:'NewCustPass!10'},reLogin.cookie)).status,400);
+  assert.equal((await call('/auth/otp/change','POST',{otp:cpOtp,password:'NewCustPass!10'},reLogin.cookie)).status,200);
+  /* staff cannot use change-password OTP endpoint */
+  assert.equal((await call('/auth/otp/change/send','POST',{},staff.cookie)).status,403);
   assert.equal((await call('/auth/forgot','POST',{email:admin.email})).status,200);
   const token=output.match(/reset=([a-f0-9]+)/)?.[1];assert.ok(token);
   assert.equal((await call('/auth/reset','POST',{token:'invalid',password:'AnotherPass!43'})).status,400);
