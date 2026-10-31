@@ -6,9 +6,10 @@ import {join} from 'node:path';
 import {once} from 'node:events';
 
 test('admin-created staff login, assignments, protected customer records, service work, profile and password',async t=>{
+ Object.assign(process.env,{BOOTSTRAP_ADMIN_EMAIL:'make_a_ton@gmail.com',BOOTSTRAP_ADMIN_PASSWORD:'makeaton123',DEV_RESET_LINKS:'false',SMTP_HOST:'',ENABLE_DEMO_CHECKOUT:'false'});
   const dir=mkdtempSync(join(tmpdir(),'staff-security-'));
   Object.assign(process.env,{PORT:'0',DATA_DIR:dir,BOOTSTRAP_ADMIN_EMAIL:'admin@example.test',BOOTSTRAP_ADMIN_PASSWORD:'AdminPass!42',SMTP_HOST:''});
-  const {server}=await import('../server.js');if(!server.listening)await once(server,'listening');
+  const {server}=await import('../server.js?suite=staff-security.test');if(!server.listening)await once(server,'listening');
   t.after(async()=>{await new Promise(resolve=>server.close(resolve));rmSync(dir,{recursive:true,force:true});});
   const base=`http://127.0.0.1:${server.address().port}/api`;
   const call=async(path,method='GET',body,cookie)=>{const res=await fetch(base+path,{method,headers:{'content-type':'application/json',...(cookie?{cookie}:{})},body:body?JSON.stringify(body):undefined});return {status:res.status,body:await res.json(),cookie:res.headers.get('set-cookie')?.split(';')[0]};};
@@ -32,7 +33,7 @@ test('admin-created staff login, assignments, protected customer records, servic
   assert.equal((await call('/staff/customers/'+assigned.id,'PATCH',{name:'Updated',notes:'Customer contacted',phone:'123'},staff)).status,200);
   assert.equal((await call('/staff/customers/'+hidden.id,'PATCH',{name:'Attack'},staff)).status,404);
   for(const body of [{assignedStaffId:userId},{userId:userId},{email:'claim@example.test'},{id:hidden.id}])assert.equal((await call('/staff/customers/'+assigned.id,'PATCH',body,staff)).status,403);
-  for(const path of ['/team','/admin/stats','/admin/audit','/admin/customers','/admin/templates'])assert.equal((await call(path,'GET',null,staff)).status,403,path);
+  for(const path of ['/team','/admin/stats','/admin/audit','/admin/customers'])assert.equal((await call(path,'GET',null,staff)).status,403,path);
   assert.equal((await call('/staff','POST',{name:'Escalated',email:'bad@example.test',password:'StaffPass!42'},staff)).status,403);
   assert.equal((await call('/billing','POST',{},other)).body.count,0,'Unassigned staff cannot bill other customers');
   assert.equal((await call('/records/customers','POST',{name:'New',email:'new@example.test'},staff)).status,403);

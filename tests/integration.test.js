@@ -6,11 +6,12 @@ import {join,resolve,sep} from 'node:path';
 import {once} from 'node:events';
 
 test('accounts, authorization, billing, payments and password recovery',async t=>{
+ Object.assign(process.env,{BOOTSTRAP_ADMIN_EMAIL:'make_a_ton@gmail.com',BOOTSTRAP_ADMIN_PASSWORD:'makeaton123',DEV_RESET_LINKS:'false',SMTP_HOST:'',ENABLE_DEMO_CHECKOUT:'false'});
   const dir=mkdtempSync(join(tmpdir(),'subscript-test-'));
   const port=13000+Math.floor(Math.random()*10000);
   Object.assign(process.env,{PORT:String(port),APP_URL:`http://localhost:${port}`,DATA_DIR:dir,DEV_RESET_LINKS:'true',SMTP_HOST:''});
   let output='';const originalLog=console.log;console.log=(...args)=>{output+=args.join(' ')+'\n';};
-  const {server}=await import('../server.js');if(!server.listening)await once(server,'listening');
+  const {server}=await import('../server.js?suite=integration.test');if(!server.listening)await once(server,'listening');
   t.after(async()=>{await new Promise(resolve=>server.close(resolve));console.log=originalLog;const p=resolve(dir);if(p.startsWith(resolve(tmpdir())+sep)&&p.includes('subscript-test-'))rmSync(p,{recursive:true,force:true});});
   const call=async(path,method='GET',body,cookie)=>{const r=await fetch(`http://127.0.0.1:${port}/api${path}`,{method,headers:{'Content-Type':'application/json',...(cookie?{cookie}:{})},body:body?JSON.stringify(body):undefined});return {status:r.status,body:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]};};
   const admin={email:'make_a_ton@gmail.com',password:'makeaton123'};

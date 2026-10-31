@@ -8,9 +8,10 @@ import {once} from 'node:events';
 import {seedSoftware} from '../scripts/seed-software-demo.js';
 
 test('Brightloop software catalog, variants, owned subscriptions, billing currencies and plan permissions',async t=>{
+ Object.assign(process.env,{BOOTSTRAP_ADMIN_EMAIL:'make_a_ton@gmail.com',BOOTSTRAP_ADMIN_PASSWORD:'makeaton123',DEV_RESET_LINKS:'false',SMTP_HOST:'',ENABLE_DEMO_CHECKOUT:'false'});
  const dir=mkdtempSync(join(tmpdir(),'brightloop-test-'));
  Object.assign(process.env,{PORT:'0',DATA_DIR:dir,BOOTSTRAP_ADMIN_EMAIL:'admin@example.test',BOOTSTRAP_ADMIN_PASSWORD:'AdminPass!42',SMTP_HOST:''});
- const {server}=await import('../server.js');if(!server.listening)await once(server,'listening');t.after(async()=>{await new Promise(r=>server.close(r));rmSync(dir,{recursive:true,force:true});});
+ const {server}=await import('../server.js?suite=software-portal.test');if(!server.listening)await once(server,'listening');t.after(async()=>{await new Promise(r=>server.close(r));rmSync(dir,{recursive:true,force:true});});
  const base=`http://127.0.0.1:${server.address().port}/api`;
  const call=async(path,method='GET',body,cookie)=>{const r=await fetch(base+path,{method,headers:{'content-type':'application/json',...(cookie?{cookie}:{})},body:body?JSON.stringify(body):undefined});return {status:r.status,body:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]};};
  const admin=(await call('/auth/login','POST',{email:'admin@example.test',password:'AdminPass!42'})).cookie;
@@ -36,6 +37,7 @@ test('Brightloop software catalog, variants, owned subscriptions, billing curren
  assert.equal((await call('/customer/subscriptions/'+sub.id,'PATCH',{action:'close'},two)).status,404);
  assert.equal((await call('/customer/subscriptions/'+sub.id,'PATCH',{status:'Active'},one)).status,400);
  assert.equal((await call('/records/subscriptions/'+sub.id,'PATCH',{status:'Active'},one)).status,403);
+ assert.equal((await call('/records/subscriptions/'+sub.id,'PATCH',{status:'Quotation'},admin)).status,200);
  assert.equal((await call('/records/subscriptions/'+sub.id,'PATCH',{status:'Confirmed'},admin)).status,200);
  assert.equal((await call('/records/subscriptions/'+sub.id,'PATCH',{status:'Active'},admin)).status,200);
  await call('/billing','POST',{},admin);

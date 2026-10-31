@@ -1,6 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {spawn} from 'node:child_process';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join,resolve,sep} from 'node:path';
@@ -10,16 +9,15 @@ import ExcelJS from 'exceljs';
 import {seedSoftware} from '../scripts/seed-software-demo.js';
 
 test('staff can build a filtered Excel report while customers cannot export workspace data', async t=>{
+ Object.assign(process.env,{BOOTSTRAP_ADMIN_EMAIL:'make_a_ton@gmail.com',BOOTSTRAP_ADMIN_PASSWORD:'makeaton123',DEV_RESET_LINKS:'false',SMTP_HOST:'',ENABLE_DEMO_CHECKOUT:'false'});
   const dir=mkdtempSync(join(tmpdir(),'brightloop-excel-test-'));
   const port=18000+Math.floor(Math.random()*10000);
   const db=new DatabaseSync(join(dir,'subscript.db'));
   db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT,email TEXT UNIQUE,password TEXT,role TEXT,status TEXT DEFAULT 'active'); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS resets(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS records(id TEXT PRIMARY KEY,type TEXT,body TEXT); CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,time TEXT,userId TEXT,action TEXT);`);
   seedSoftware(db);db.close();
-  const child=spawn(process.execPath,['server.js'],{cwd:process.cwd(),env:{...process.env,PORT:String(port),APP_URL:`http://localhost:${port}`,DATA_DIR:dir,DEV_RESET_LINKS:'true',SMTP_HOST:''},stdio:['ignore','pipe','pipe']});
-  let output='';child.stdout.on('data',data=>output+=data);child.stderr.on('data',data=>output+=data);
-  t.after(async()=>{child.kill();if(child.exitCode===null)await once(child,'exit');const target=resolve(dir);if(target.startsWith(resolve(tmpdir())+sep)&&target.includes('brightloop-excel-test-'))rmSync(target,{recursive:true,force:true});});
-  for(let n=0;n<120&&!output.includes('running at');n++)await new Promise(resolve=>setTimeout(resolve,50));
-  assert.match(output,/running at/);
+  Object.assign(process.env,{PORT:String(port),APP_URL:`http://localhost:${port}`,DATA_DIR:dir,DEV_RESET_LINKS:'true',SMTP_HOST:''});
+  const {server}=await import('../server.js?suite=excel-report.test');if(!server.listening)await once(server,'listening');
+  t.after(async()=>{await new Promise(done=>server.close(done));rmSync(dir,{recursive:true,force:true});});
 
   const request=async(path,method='GET',body,cookie)=>{
     const response=await fetch(`http://127.0.0.1:${port}/api${path}`,{method,headers:{'Content-Type':'application/json',...(cookie?{cookie}:{})},body:body?JSON.stringify(body):undefined});
@@ -32,6 +30,8 @@ test('staff can build a filtered Excel report while customers cannot export work
   const staff=await request('/auth/login','POST',{email:'reports@brightloop.test',password:'ReportStaff!123'});
   assert.equal(staff.status,200);
 
+  const allCustomers=(await request('/state','GET',null,admin.cookie)).body.customers;
+  for(const c of allCustomers)assert.equal((await request('/records/customers/'+c.id,'PATCH',{assignedStaffId:staff.body.user.id},admin.cookie)).status,200);
   const schema=await request('/reports/schema','GET',null,staff.cookie);
   assert.equal(schema.status,200);
   assert.ok(schema.body.datasets.some(item=>item.key==='subscriptions'));

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 test('automated 3-stage plan expiry emails: 1 week before, 1 day before, and on expiry date', async () => {
+ Object.assign(process.env,{BOOTSTRAP_ADMIN_EMAIL:'make_a_ton@gmail.com',BOOTSTRAP_ADMIN_PASSWORD:'makeaton123',DEV_RESET_LINKS:'false',SMTP_HOST:'',ENABLE_DEMO_CHECKOUT:'false'});
   const dir = mkdtempSync(join(tmpdir(), 'expiry-email-test-'));
   process.env.DATA_DIR = dir;
   process.env.PORT = '0';
@@ -134,7 +135,7 @@ test('automated 3-stage plan expiry emails: 1 week before, 1 day before, and on 
     assert.equal(initialNoticeCount, secondaryNoticeCount, 'Automation must be idempotent and avoid duplicate notices');
 
   } finally {
-    server.close();
+    await new Promise(resolve=>server.close(resolve));
     try { rmSync(dir, { recursive: true, force: true }); } catch {}
   }
 });

@@ -1,0 +1,8 @@
+export function reportStats(data,users,currency='INR'){
+ if(!['INR','USD'].includes(currency))throw Object.assign(new Error('Choose INR or USD.'),{code:400});
+ const {subscriptions:subs,invoices,payments,customers,products,plans}=data,today=new Date().toISOString().slice(0,10),round=n=>Math.round(n*100)/100;
+ const scoped=invoices.filter(i=>(i.currency||'USD')===currency),ids=new Set(scoped.map(i=>i.id)),paid=new Map();
+ const pays=payments.filter(p=>ids.has(p.invoiceId));for(const p of pays)paid.set(p.invoiceId,(paid.get(p.invoiceId)||0)+Number(p.amount));
+ const balance=i=>Math.max(0,round(Number(i.total)-(paid.get(i.id)||0))),active=subs.filter(s=>(s.currency||'USD')===currency&&s.status==='Active'&&(!s.ends||s.ends>=today)),overdue=scoped.filter(i=>i.status==='Confirmed'&&i.due<today&&balance(i)>0);
+ return {currency,mrr:round(active.reduce((n,s)=>n+(s.lines?.length?s.lines:[s]).reduce((v,l)=>v+Number(l.quantity)*Number(l.unitPrice),0)*({Daily:30.4375,Weekly:52/12,Monthly:1,Yearly:1/12}[s.cycle]||1),0)),totalRevenue:round(pays.reduce((n,p)=>n+Number(p.amount),0)),owed:round(scoped.filter(i=>i.status==='Confirmed').reduce((n,i)=>n+balance(i),0)),activeSubscriptions:active.length,totalSubscriptions:subs.filter(s=>(s.currency||'USD')===currency).length,overdueInvoices:overdue.length,overdueAmount:round(overdue.reduce((n,i)=>n+balance(i),0)),totalInvoices:scoped.length,paidInvoices:scoped.filter(i=>i.status==='Paid').length,draftInvoices:scoped.filter(i=>i.status==='Draft').length,totalPayments:pays.length,totalCustomers:customers.length,staffCount:users.filter(u=>u.role==='staff'&&u.status!=='deactivated').length,planCount:plans.length,productCount:products.length};
+}

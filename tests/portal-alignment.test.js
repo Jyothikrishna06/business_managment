@@ -1,6 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {spawn} from 'node:child_process';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join,resolve,sep} from 'node:path';
@@ -9,6 +8,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {seedSoftware} from '../scripts/seed-software-demo.js';
 
 test('alignment of customer, admin, and staff portals: details, variants, permissions, and management', async t => {
+ Object.assign(process.env,{BOOTSTRAP_ADMIN_EMAIL:'make_a_ton@gmail.com',BOOTSTRAP_ADMIN_PASSWORD:'makeaton123',DEV_RESET_LINKS:'false',SMTP_HOST:'',ENABLE_DEMO_CHECKOUT:'false'});
   const dir = mkdtempSync(join(tmpdir(), 'portal-alignment-test-'));
   const port = 16000 + Math.floor(Math.random() * 10000);
   
@@ -17,26 +17,9 @@ test('alignment of customer, admin, and staff portals: details, variants, permis
   seedSoftware(db);
   db.close();
 
-  const child = spawn(process.execPath, ['server.js'], {
-    cwd: process.cwd(),
-    env: {...process.env, PORT: String(port), APP_URL: `http://localhost:${port}`, DATA_DIR: dir, DEV_RESET_LINKS: 'true', SMTP_HOST: ''},
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-  let output = '';
-  child.stdout.on('data', d => output += d);
-  child.stderr.on('data', d => output += d);
-
-  t.after(async () => {
-    child.kill();
-    if (child.exitCode === null) await once(child, 'exit');
-    const p = resolve(dir);
-    if (p.startsWith(resolve(tmpdir()) + sep) && p.includes('portal-alignment-test-')) {
-      rmSync(p, {recursive: true, force: true});
-    }
-  });
-
-  for (let n = 0; n < 100 && !output.includes('running at'); n++) await new Promise(r => setTimeout(r, 50));
-  assert.match(output, /running at/);
+  Object.assign(process.env,{PORT:String(port),APP_URL:`http://localhost:${port}`,DATA_DIR:dir,DEV_RESET_LINKS:'true',SMTP_HOST:''});
+  const {server}=await import('../server.js?suite=portal-alignment.test');if(!server.listening)await once(server,'listening');
+  t.after(async()=>{await new Promise(done=>server.close(done));rmSync(dir,{recursive:true,force:true});});
 
   const call = async (path, method = 'GET', body, cookie) => {
     const r = await fetch(`http://127.0.0.1:${port}/api${path}`, {
@@ -98,6 +81,7 @@ test('alignment of customer, admin, and staff portals: details, variants, permis
   assert.equal(sub.variantName, 'Odoo');
   assert.equal(sub.currency, 'INR');
 
+  assert.equal((await call('/records/customers/'+custState.body.customers[0].id,'PATCH',{assignedStaffId:staffLogin.body.user.id},adminCookie)).status,200);
   // 5. Staff and Admin verify the subscription details match the customer page
   const staffState = await call('/state', 'GET', null, staffCookie);
   assert.equal(staffState.status, 200);
@@ -108,6 +92,7 @@ test('alignment of customer, admin, and staff portals: details, variants, permis
   assert.equal(staffFoundSub.status, 'Draft');
 
   // Staff confirms the customer's draft subscription (setting status to Confirmed)
+  assert.equal((await call(`/records/subscriptions/${sub.id}`,'PATCH',{status:'Quotation'},staffCookie)).status,200);
   const confirmRes = await call(`/records/subscriptions/${sub.id}`, 'PATCH', {status: 'Confirmed'}, staffCookie);
   assert.equal(confirmRes.status, 200);
   assert.equal(confirmRes.body.status, 'Confirmed');
