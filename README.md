@@ -1,6 +1,6 @@
 # Brightloop Software Subscription Management
 
-The shared visual theme in `theme.css` is inspired by [Mixroutes](https://www.mixroutes.com/): white backgrounds, black headings, Plus Jakarta Sans typography, Figtree action labels, green `#25D366` primary actions, soft gray surfaces and rounded cards. It applies to sign-in and all three portals, with responsive layouts and visible keyboard focus. The underlying portal workflows are unchanged by this theme layer.
+The shared visual theme in `theme.css`: white backgrounds, black headings, Plus Jakarta Sans typography, Figtree action labels, green `#25D366` primary actions, soft gray surfaces and rounded cards. It applies to sign-in and all three portals, with responsive layouts and visible keyboard focus. The underlying portal workflows are unchanged by this theme layer.
 
 A local subscription-management application with a Google Search Console inspired interface, Roboto typography, Material Symbols, rounded navigation selection and pill filters.
 
