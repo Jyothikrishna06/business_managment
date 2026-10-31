@@ -1,3 +1,4 @@
+import {createStaffSales} from './staff-sales-server.js';
 import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
@@ -27,7 +28,10 @@ function ensureBootstrapAdmin(){
 }
 ensureBootstrapAdmin();
 function calculate(s,date){
-  const product=all('products').find(p=>p.id===s.productId); const quantity=Number(s.quantity); const subtotal=Number(s.unitPrice ?? product?.price ?? 0)*quantity;
+  const product=all('products').find(p=>p.id===s.productId);
+  const lines=s.staffSale?s.lines.filter(l=>l.charge==='Recurring'||date===s.starts):null;
+  const quantity=lines?lines.filter(l=>l.charge==='Recurring').reduce((n,l)=>n+Number(l.quantity),0):Number(s.quantity);
+  const subtotal=lines?lines.reduce((n,l)=>n+Number(l.unitPrice)*Number(l.quantity),0):Number(s.unitPrice ?? product?.price ?? 0)*quantity;
   const discount=all('discounts').find(d=>d.id===s.discountId);
   let deduction=0;
   if(discount && (!discount.starts||discount.starts<=date) && (!discount.ends||discount.ends>=date) && (!discount.limit||Number(discount.used||0)<Number(discount.limit)) && quantity>=Number(discount.minQuantity||1)) {
@@ -35,19 +39,19 @@ function calculate(s,date){
   }
   deduction=Math.min(subtotal,deduction);
   const tax=all('taxes').find(t=>t.id===s.taxId); const taxAmount=(subtotal-deduction)*Number(tax?.rate||0)/100;
-  return {subtotal,discount:deduction,tax:taxAmount,total:Math.round((subtotal-deduction+taxAmount)*100)/100};
+  return {subtotal,discount:deduction,tax:taxAmount,total:Math.round((subtotal-deduction+taxAmount)*100)/100,...(lines?{lines:lines.map(l=>({...l,amount:Math.round(l.quantity*l.unitPrice*100)/100}))}:{})};
 }
 function nextDate(date,cycle,anchor){ const d=new Date(`${date}T12:00:00Z`); const day=d.getUTCDate(); if(cycle==='Daily')d.setUTCDate(day+1);else if(cycle==='Weekly')d.setUTCDate(day+7);else {d.setUTCDate(1);if(cycle==='Yearly')d.setUTCFullYear(d.getUTCFullYear()+1);else d.setUTCMonth(d.getUTCMonth()+1);const last=new Date(Date.UTC(d.getUTCFullYear(),d.getUTCMonth()+1,0)).getUTCDate();d.setUTCDate(Math.min(anchor||day,last));}return d.toISOString().slice(0,10); }
-function bill(){
+function bill(customerIds=null){
   const today=new Date().toISOString().slice(0,10);let count=0;db.exec('BEGIN IMMEDIATE');
   try{for(const s of all('subscriptions')){
-    if(s.status!=='Active')continue;let due=s.nextBilling||s.starts;let n=0;
+    if(s.status!=='Active'||customerIds&&!customerIds.has(s.customerId))continue;let due=s.nextBilling||s.starts;let n=0;
     while(due&&due<=today&&n++<120){
       if(s.ends&&due>s.ends){s.status='Closed';break;}
       if(!all('invoices').some(i=>i.subscriptionId===s.id&&i.billingDate===due)){
         const totals=calculate(s,due),customer=all('customers').find(c=>c.id===s.customerId),product=all('products').find(p=>p.id===s.productId);
         const dueDate=new Date(`${due}T12:00:00Z`);dueDate.setUTCDate(dueDate.getUTCDate()+Number(String(s.terms||'').match(/Net (7|15|30|60)/)?.[1]||0));
-        put('invoices',{id:uid(),number:`INV-${uid().slice(0,8).toUpperCase()}`,customerId:s.customerId,subscriptionId:s.id,billingDate:due,due:dueDate.toISOString().slice(0,10),status:totals.total===0?'Paid':'Confirmed',line:{name:product.name,quantity:s.quantity,unitPrice:s.unitPrice},customer:{name:customer.name,email:customer.email},terms:s.terms||'',...totals});count++;
+        put('invoices',{id:uid(),number:`INV-${uid().slice(0,8).toUpperCase()}`,customerId:s.customerId,subscriptionId:s.id,billingDate:due,due:dueDate.toISOString().slice(0,10),status:s.staffSale?'Draft':totals.total===0?'Paid':'Confirmed',line:{name:product.name,quantity:s.quantity,unitPrice:s.unitPrice},customer:{name:customer.name,email:customer.email},terms:s.terms||'',...totals});count++;
         if(totals.discount&&s.discountId){const d=all('discounts').find(d=>d.id===s.discountId);put('discounts',{...d,used:Number(d.used||0)+1});}
       }
       due=nextDate(due,s.cycle||'Monthly',Number(s.starts.slice(8,10)));
@@ -90,6 +94,7 @@ function staffState(user){
   const customers=all('customers').filter(c=>c.assignedStaffId===user.id);
   const ids=new Set(customers.map(c=>c.id));
   return {
+    sales:staffSales.state(user),
     customers:customers.map(({id,name,email,company,phone,notes})=>({id,name,email,company,phone,notes})),
     subscriptions:all('subscriptions').filter(s=>ids.has(s.customerId)).map(({id,number,customerId,status,starts,ends,nextBilling,cycle})=>({id,number,customerId,status,starts,ends,nextBilling,cycle})),
     tasks:all('staffTasks').filter(t=>t.assignedStaffId===user.id&&ids.has(t.customerId)),
@@ -97,9 +102,10 @@ function staffState(user){
     activity:db.prepare('SELECT time,action FROM audit WHERE userId=? ORDER BY id DESC LIMIT 50').all(user.id)
   };
 }
+const staffSales=createStaffSales({all,put,uid,fail,assignedCustomer,audit,calculate,bill,db});
 const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http://localhost');const path=url.pathname;const send=(data,code=200,headers={})=>{res.writeHead(code,{'Content-Type':'application/json','Cache-Control':'no-store',...headers});res.end(JSON.stringify(data));};try{
   res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('X-Frame-Options','DENY');res.setHeader('Referrer-Policy','same-origin');
-  if(!path.startsWith('/api/')){const files={'/':'index.html','/index.html':'index.html','/app.js':'app.js','/staff.js':'staff.js','/styles.css':'styles.css'};if(!files[path])return send({error:'Not found'},404);res.setHeader('Content-Type',path.endsWith('.js')?'text/javascript':path.endsWith('.css')?'text/css':'text/html');res.end(readFileSync(`${root}${files[path]}`));return;}
+  if(!path.startsWith('/api/')){const files={'/':'index.html','/index.html':'index.html','/app.js':'app.js','/staff.js':'staff.js','/staff-sales.js':'staff-sales.js','/styles.css':'styles.css'};if(!files[path])return send({error:'Not found'},404);res.setHeader('Content-Type',path.endsWith('.js')?'text/javascript':path.endsWith('.css')?'text/css':'text/html');res.end(readFileSync(`${root}${files[path]}`));return;}
   if(req.method!=='GET' && req.headers.origin && req.headers.origin!==`${req.headers['x-forwarded-proto']||'http'}://${req.headers.host}`)fail('Invalid request origin.',403);
   const b=req.method==='GET'?{}:await body(req);const email=String(b.email||'').trim().toLowerCase();
   if(path==='/api/auth/register'&&req.method==='POST'){
@@ -147,6 +153,7 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
     const task=put('staffTasks',{id:uid(),customerId:c.id,assignedStaffId:b.assignedStaffId,title:b.title.trim(),due:b.due,status:'Open'});
     audit(u,'Assigned staff task');return send(task);
   }
+  if(path.startsWith('/api/staff/sales/'))return send(await staffSales.handle(u,path,req.method,b));
   if(u.role==='staff'){
     const route=path.match(/^\/api\/staff\/(customers|tasks|support)(?:\/([a-f0-9]+))?$/);
     if(!route)fail('Administrator access required.',403);
@@ -196,7 +203,7 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
   if(req.method==='POST'||req.method==='PATCH'){
     const old=id?all(type).find(r=>r.id===id):undefined;if(id&&!old)fail('Record not found.',404);let r={...old,...b,id:id||uid()};delete r.password;
     if(type==='invoices')fail('Invoices are generated from subscriptions. Use invoice actions.');
-    if(type==='payments'){if(id)fail('Payments cannot be edited.');validate(type,r);const i=all('invoices').find(i=>i.id===r.invoiceId);if(!i||i.status==='Cancelled')fail('Choose a confirmed invoice.');const paid=all('payments').filter(p=>p.invoiceId===i.id).reduce((s,p)=>s+Number(p.amount),0);if(!(Number(r.amount)>0)||Number(r.amount)>i.total-paid+0.001)fail('Amount exceeds the outstanding balance or is invalid.');if(!r.date||!['Bank transfer','Card','Cash','Other'].includes(r.method))fail('Payment date and method are required.');db.exec('BEGIN IMMEDIATE');try{put(type,r);put('invoices',{...i,status:paid+Number(r.amount)>=i.total-0.001?'Paid':'Confirmed'});db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}}
+    if(type==='payments'){if(id)fail('Payments cannot be edited.');validate(type,r);const i=all('invoices').find(i=>i.id===r.invoiceId);if(!i||i.status!=='Confirmed')fail('Choose a confirmed invoice.');const paid=all('payments').filter(p=>p.invoiceId===i.id).reduce((s,p)=>s+Number(p.amount),0);if(!(Number(r.amount)>0)||Number(r.amount)>i.total-paid+0.001)fail('Amount exceeds the outstanding balance or is invalid.');if(!r.date||!['Bank transfer','Card','Cash','Other'].includes(r.method))fail('Payment date and method are required.');db.exec('BEGIN IMMEDIATE');try{put(type,r);put('invoices',{...i,status:paid+Number(r.amount)>=i.total-0.001?'Paid':'Confirmed'});db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}}
     else {validate(type,r);if(type==='subscriptions'){if(old&&old.status==='Closed'&&r.status!=='Closed')fail('Renew a closed subscription as a new contract.');if(old&&all('invoices').some(i=>i.subscriptionId===id)&&['starts','customerId','productId','quantity','unitPrice','planId'].some(k=>String(old[k])!==String(r[k])))fail('Billed contract details cannot be changed. Create a new subscription for pricing changes.');r.nextBilling=old?.nextBilling||r.starts;}if(type==='customers'){if(r.assignedStaffId&&!db.prepare("SELECT id FROM users WHERE id=? AND role='staff'").get(r.assignedStaffId))fail('Choose a valid staff member.');const account=db.prepare('SELECT id FROM users WHERE email=? AND role=?').get(r.email,'customer');r.userId=account?.id||null;}if(type==='quotations'&&old?.subscriptionId)r.subscriptionId=old.subscriptionId;if(type==='discounts')r.used=old?.used||0;put(type,r);}audit(u,`${id?'Updated':'Created'} ${type}: ${r.id}`);return send(r);
   }
   if(req.method==='DELETE'){if(['payments','invoices','subscriptions'].includes(type))fail('Financial records are retained. Close or cancel them instead.');const references={customers:['customerId'],products:['productId'],plans:['planId'],discounts:['discountId'],taxes:['taxId']};if(types.some(t=>all(t).some(r=>(references[type]||[]).some(key=>r[key]===id))))fail('This record is in use and cannot be deleted.');db.prepare('DELETE FROM records WHERE id=? AND type=?').run(id,type);audit(u,`Deleted ${type}: ${id}`);return send({ok:true});}
