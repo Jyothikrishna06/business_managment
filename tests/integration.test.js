@@ -31,6 +31,7 @@ test('accounts, authorization, billing, payments and password recovery',async t=
   assert.equal((await call('/billing','POST',{},cookie)).body.count,1);
   assert.equal((await call('/billing','POST',{},cookie)).body.count,0);
   let state=(await call('/state','GET',null,cookie)).body;const invoice=state.invoices[0];assert.equal(invoice.total,99);assert.equal(state.discounts[0].used,1);
+  assert.equal(invoice.status,'Draft');assert.equal((await call('/invoice-action','POST',{id:invoice.id,action:'confirm'},cookie)).status,200);
   await create('payments',{invoiceId:invoice.id,amount:40,method:'Card',date:today});
   assert.equal((await call('/records/payments','POST',{invoiceId:invoice.id,amount:60,method:'Card',date:today},cookie)).status,400);
   await create('payments',{invoiceId:invoice.id,amount:59,method:'Bank transfer',date:today});

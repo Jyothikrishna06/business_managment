@@ -25,10 +25,15 @@ The application has three separate role experiences: administrator, staff and cu
 - Profile page and role restrictions enforced by the backend.
 - Create, edit and search products, plans, customers, discount rules and tax rules.
 - Quotation creation and conversion to a confirmed subscription.
+- Reusable quotation templates with validity periods and multiple product, service or add-on lines.
 - Persistent in-app notifications for admin, staff and customers, including quotation submission, expiry reminders, expiry, and conversion updates.
 - Subscription activation, pause, close and renewal through a new contract.
+- Enforced subscription status transitions and optional automatic closure at the contract expiry date.
 - Recurring invoices generated from active subscriptions, once per billing period; discounts and taxes calculated automatically.
+- Draft invoice review and confirmation before collection, with immutable product-line snapshots.
 - Record partial/full payments, reject overpayments and track outstanding/overdue balances.
+- Product-scoped or subscription-wide discounts with quantity, purchase amount, validity and usage limits.
+- Customer-managed add-ons for confirmed subscriptions; changes affect future billing only.
 - Print invoices or save them as PDFs with the browser print dialog, email invoice summaries, cancel unpaid invoices.
 - Actual revenue chart, dashboard summaries, overdue report, invoice CSV export and printable reports.
 - SQLite persistence and audit records in `data/subscript.db`; data is excluded from Git.
@@ -43,10 +48,10 @@ For local testing only, set `DEV_RESET_LINKS=true` in `.env`. With SMTP_HOST uns
 
 1. Sign in as the bootstrap administrator, or change its credentials in `.env` before starting the server.
 2. Create a product, billing plan, customer, and optionally a tax/discount rule.
-3. Create a subscription and activate it, or create and convert a quotation first.
-4. Open Invoices and choose Run billing. A background job also runs every minute while the server is running.
-5. Record payments against invoices. Dashboard totals update from saved records.
-6. Customer registrations open the customer portal. To connect an existing billing record, verify the account owner and save that customer record again using the registered email. Public registration alone never grants access to preexisting contracts.
+3. Create a subscription and activate it, or create a reusable quotation template and convert a customer quotation first.
+4. Open Invoices and choose Run billing. Review and confirm generated drafts; a background job also runs every minute while the server is running.
+5. Record payments against confirmed invoices. Dashboard totals update from saved records.
+6. Customer registrations open the customer portal. To connect an existing billing record, verify the account owner and use Customer accounts to link the matching email. Public registration alone never grants access to preexisting contracts.
 
 ## Validation
 
@@ -58,7 +63,7 @@ Integration tests exercise authentication, authorization, billing idempotency, t
 
 ## Current scope
 
-This is a working local MVP. Payments are recorded manually; no payment processor charges cards. Customers can request draft subscriptions, print their own invoices, view recorded payments and use administrator-permitted pause, resume, close and renewal actions. Software product variants have names and price adjustments; Accounting Software demonstrates Basic and Odoo brands. Contracts currently have a single product line. Advanced quotation templates, prorations, payment retries, customer plan changes, email verification, recurring reminder emails and multi-tenant workspaces are future work. Availability filters and the chart use UTC billing dates. Large datasets are loaded into memory; pagination and performance work are needed before claiming the PDF's two-second target at scale.
+This is a working local MVP. Payments are recorded manually; no payment processor charges cards. Customers can request draft subscriptions, manage add-ons after confirmation, print their own invoices, view recorded payments and use administrator-permitted pause, resume, close and renewal actions. Software product variants have names and price adjustments; Accounting Software demonstrates Basic and Odoo brands. Quotation templates, subscriptions and invoices support multiple product lines. Prorations, payment retries, email verification, recurring email reminders and multi-tenant workspaces remain future work. Availability filters and the chart use UTC billing dates. Paginated record endpoints query SQLite directly, while the dashboard state payload still needs server-side aggregation before claiming the PDF's two-second target for every view at very large scale.
 
 The server binds to loopback. Before hosting, configure HTTPS, secure cookies and SMTP, and replace first-registration administrator setup with an explicit deployment bootstrap. Back up SQLite data and use a supervised scheduler if the app must bill while its UI is closed or its process restarts. Fonts load from Google Fonts with Arial fallback.
 

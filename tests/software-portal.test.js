@@ -36,9 +36,11 @@ test('Brightloop software catalog, variants, owned subscriptions, billing curren
  assert.equal((await call('/customer/subscriptions/'+sub.id,'PATCH',{action:'close'},two)).status,404);
  assert.equal((await call('/customer/subscriptions/'+sub.id,'PATCH',{status:'Active'},one)).status,400);
  assert.equal((await call('/records/subscriptions/'+sub.id,'PATCH',{status:'Active'},one)).status,403);
+ assert.equal((await call('/records/subscriptions/'+sub.id,'PATCH',{status:'Confirmed'},admin)).status,200);
  assert.equal((await call('/records/subscriptions/'+sub.id,'PATCH',{status:'Active'},admin)).status,200);
  await call('/billing','POST',{},admin);
  state=(await call('/state','GET',null,one)).body;const invoice=state.invoices.find(i=>i.subscriptionId===sub.id);assert.ok(invoice);assert.equal(invoice.total,1060);assert.equal(invoice.currency,'INR');assert.match(invoice.line.name,/Accounting Software · Odoo/);
+ assert.equal(invoice.status,'Draft');assert.equal((await call('/invoice-action','POST',{id:invoice.id,action:'confirm'},admin)).status,200);
  assert.equal((await call('/state','GET',null,two)).body.invoices.length,0);
  await call('/billing','POST',{},admin);assert.equal((await call('/state','GET',null,one)).body.invoices.length,1);
  const payment={invoiceId:invoice.id,amount:1060,method:'Bank transfer',date:new Date().toISOString().slice(0,10),notes:'Manual payment'};
