@@ -1,4 +1,5 @@
 import {createSoftwarePortal} from './software-server.js';
+import {createExcelReport,reportSchema} from './excel-report.js';
 import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
@@ -169,6 +170,14 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
   if(path==='/api/state'&&req.method==='GET'){subscriptionAutomation();const data=Object.fromEntries(types.map(t=>[t,all(t)]));if(u.role==='customer'){data.catalog=softwarePortal.catalog();const ids=data.customers.filter(c=>c.userId===u.id).map(c=>c.id);for(const t of ['subscriptions','quotations','invoices'])data[t]=data[t].filter(r=>ids.includes(r.customerId));const invoices=data.invoices.map(i=>i.id);data.payments=data.payments.filter(p=>invoices.includes(p.invoiceId));data.customers=data.customers.filter(c=>ids.includes(c.id));const ownedProductIds=new Set(data.subscriptions.flatMap(s=>recordLines(s).map(line=>line.productId)));data.products=data.products.filter(p=>ownedProductIds.has(p.id)).map(({id,name,price,currency})=>({id,name,price,currency}));data.quotationTemplates=[];data.discounts=[];data.taxes=[];}return send(data);}
   if(path.startsWith('/api/customer/'))return send(softwarePortal.handle(u,path,req.method,b));
   if(u.role==='customer')fail('You do not have permission to perform this action.',403);
+  if(path==='/api/reports/schema'&&req.method==='GET')return send(reportSchema());
+  if(path==='/api/reports/xlsx'&&req.method==='POST'){
+    const records=Object.fromEntries(types.map(type=>[type,all(type)]));
+    const report=await createExcelReport(b,records,publicUser(u));
+    audit(u,`Exported ${b.dataset} report with ${report.count} records`);
+    res.writeHead(200,{'Content-Type':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet','Content-Disposition':`attachment; filename="${report.filename}"`,'Content-Length':report.buffer.length,'Cache-Control':'no-store','X-Report-Count':String(report.count)});
+    res.end(report.buffer);return;
+  }
   if(path==='/api/team'&&req.method==='GET'){if(u.role!=='admin')fail('Administrator access required.',403);return send(db.prepare("SELECT id,name,email,role,COALESCE(status,'active') as status FROM users WHERE role IN ('admin','staff')").all());}
   if(path==='/api/admin/customers'&&req.method==='GET'){if(u.role!=='admin')fail('Administrator access required.',403);return send(db.prepare("SELECT id,name,email,role,COALESCE(status,'active') as status FROM users WHERE role='customer'").all());}
   const linkMatch=path.match(/^\/api\/admin\/customers\/([a-f0-9]+)\/link$/);if(linkMatch&&req.method==='POST'){if(u.role!=='admin')fail('Administrator access required.',403);const account=db.prepare("SELECT * FROM users WHERE id=? AND role='customer'").get(linkMatch[1]),customer=all('customers').find(c=>c.id===b.customerId);if(!account||!customer)fail('Choose a valid customer account and billing record.',404);if(customer.email.toLowerCase()!==account.email.toLowerCase())fail('The account and billing record email addresses must match.');if(customer.userId&&customer.userId!==account.id)fail('This billing record is linked to another account.');put('customers',{...customer,userId:account.id});for(const duplicate of all('customers').filter(c=>c.id!==customer.id&&c.userId===account.id)){const used=['subscriptions','quotations'].some(type=>all(type).some(record=>record.customerId===duplicate.id));if(!used)db.prepare("DELETE FROM records WHERE id=? AND type='customers'").run(duplicate.id);}audit(u,`Linked customer account ${account.email}`);return send({ok:true});}
