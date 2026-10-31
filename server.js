@@ -11,7 +11,7 @@ import nodemailer from 'nodemailer';
 const root = fileURLToPath(new URL('.', import.meta.url));
 mkdirSync(process.env.DATA_DIR || `${root}data`, { recursive: true });
 const db = new DatabaseSync(`${process.env.DATA_DIR || `${root}data`}/subscript.db`);
-db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT,email TEXT UNIQUE,password TEXT,role TEXT,status TEXT DEFAULT 'active'); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS resets(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS records(id TEXT PRIMARY KEY,type TEXT,body TEXT); CREATE INDEX IF NOT EXISTS records_type_idx ON records(type); CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,time TEXT,userId TEXT,action TEXT); CREATE TABLE IF NOT EXISTS notifications(id TEXT PRIMARY KEY,userId TEXT,title TEXT,message TEXT,type TEXT,referenceId TEXT,createdAt TEXT,readAt TEXT,UNIQUE(userId,type,referenceId)); CREATE INDEX IF NOT EXISTS notifications_user_idx ON notifications(userId,createdAt DESC);`);
+db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT,email TEXT UNIQUE,password TEXT,role TEXT,status TEXT DEFAULT 'active'); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS resets(token TEXT PRIMARY KEY,userId TEXT,expires INTEGER); CREATE TABLE IF NOT EXISTS records(id TEXT PRIMARY KEY,type TEXT,body TEXT); CREATE INDEX IF NOT EXISTS records_type_idx ON records(type); CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,time TEXT,userId TEXT,action TEXT); CREATE TABLE IF NOT EXISTS notifications(id TEXT PRIMARY KEY,userId TEXT,title TEXT,message TEXT,type TEXT,referenceId TEXT,createdAt TEXT,readAt TEXT,UNIQUE(userId,type,referenceId)); CREATE INDEX IF NOT EXISTS notifications_user_idx ON notifications(userId,createdAt DESC); CREATE TABLE IF NOT EXISTS expiry_notices(id TEXT PRIMARY KEY,subscriptionId TEXT,stage TEXT,sentAt TEXT,UNIQUE(subscriptionId,stage));`);
 try{db.exec(`ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'`);}catch{/* column may already exist */}
 const types = ['products','plans','customers','quotationTemplates','quotations','subscriptions','invoices','payments','discounts','taxes'];
 const hash = v => createHash('sha256').update(v).digest('hex');
@@ -85,9 +85,69 @@ function bill(){
     if(plan?.autoClose===true&&s.ends&&s.ends<today&&due>s.ends)s.status='Closed';s.nextBilling=due;put('subscriptions',s);
   }db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}return count;
 }
+async function sendExpiryEmail(subscription,stage,daysRemaining){
+  const existing=db.prepare('SELECT id FROM expiry_notices WHERE subscriptionId=? AND stage=?').get(subscription.id,stage);
+  if(existing)return;
+  const customer=all('customers').find(c=>c.id===subscription.customerId);
+  if(!customer?.email)return;
+  db.prepare('INSERT OR IGNORE INTO expiry_notices VALUES(?,?,?,?)').run(uid(),subscription.id,stage,new Date().toISOString());
+  const product=all('products').find(p=>p.id===subscription.productId)||{name:'Product'};
+  const currentPlan=all('plans').find(p=>p.id===subscription.planId)||{};
+  const availablePlans=all('plans').filter(p=>p.productId===subscription.productId);
+  const currency=subscription.currency||product.currency||'INR';
+  const fmt=val=>new Intl.NumberFormat('en-IN',{style:'currency',currency,maximumFractionDigits:2}).format(Number(val||0));
+  const appUrl=process.env.APP_URL||'http://localhost:3000';
+  let subject='',headline='',desc='';
+  if(stage==='week_before'){
+    subject=`Notice: Your ${product.name} subscription expires in 7 days`;
+    headline='Subscription Expiry Notice — 7 Days Remaining';
+    desc=`Your subscription (${subscription.number}) for ${product.name} will expire on ${subscription.ends} (in 7 days).`;
+  }else if(stage==='day_before'){
+    subject=`Urgent: Your ${product.name} subscription expires tomorrow`;
+    headline='Urgent Notice — 1 Day Remaining';
+    desc=`Your subscription (${subscription.number}) for ${product.name} will expire tomorrow on ${subscription.ends}.`;
+  }else{
+    subject=`Notice: Your ${product.name} subscription expires today`;
+    headline='Subscription Expiration Notice — Expires Today';
+    desc=`Your subscription (${subscription.number}) for ${product.name} reaches its expiration date today (${subscription.ends}).`;
+  }
+  const plansText=availablePlans.length
+    ? availablePlans.map(p=>`  • ${p.name}: ${fmt(p.price)} / ${p.cycle||'Monthly'}${p.minQuantity>1?` (Min qty: ${p.minQuantity})`:''}`).join('\n')
+    : '  • Contact support for renewal plan options.';
+  const plansHtml=availablePlans.length
+    ? availablePlans.map(p=>`<tr style="border-bottom:1px solid #e0e0e0"><td style="padding:10px 14px;font-weight:600;color:#192536">${p.name}</td><td style="padding:10px 14px;color:#1967d2;font-weight:600">${fmt(p.price)}</td><td style="padding:10px 14px;color:#5f6368">${p.cycle||'Monthly'}</td><td style="padding:10px 14px;color:#5f6368">${p.minQuantity||1} unit(s)</td></tr>`).join('')
+    : '<tr><td colspan="4" style="padding:12px;color:#777">Contact support for renewal plan options.</td></tr>';
+  const textBody=`Hello ${customer.name||'Customer'},\n\n${headline}\n${desc}\n\nSUBSCRIPTION DETAILS:\n• Subscription Number: ${subscription.number}\n• Product: ${product.name}${subscription.variantName?` (${subscription.variantName})`:''}\n• Current Plan: ${currentPlan.name||'Standard'} (${subscription.cycle||'Monthly'})\n• Expiry Date: ${subscription.ends}\n• Quantity & Rate: ${subscription.quantity} × ${fmt(subscription.unitPrice)}\n\nAVAILABLE PLANS FOR ${product.name.toUpperCase()}:\n${plansText}\n\nTo renew or change your plan, sign in to your Brightloop portal:\n${appUrl}\n\nThank you,\nBrightloop Software Support Team`;
+  const htmlBody=`<div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;padding:24px;color:#202124;background:#fff;border:1px solid #e0e0e0;border-radius:12px"><div style="border-bottom:2px solid #1967d2;padding-bottom:14px;margin-bottom:20px"><h2 style="color:#1967d2;margin:0;font-size:22px">Brightloop Software</h2><p style="margin:4px 0 0;color:#5f6368;font-size:13px">Subscription & Plan Expiry Notification</p></div><div style="background:#f1f5fd;border-left:4px solid #1967d2;padding:14px 18px;margin-bottom:22px;border-radius:4px"><strong style="color:#174ea6;font-size:16px;display:block;margin-bottom:6px">${headline}</strong><p style="margin:0;font-size:14px;color:#3c4043;line-height:1.5">${desc}</p></div><h3 style="font-size:15px;color:#192536;margin-bottom:10px">Subscription Summary</h3><table style="width:100%;border-collapse:collapse;margin-bottom:24px;font-size:13px"><tr style="background:#fafafa"><td style="padding:8px 12px;font-weight:bold;width:40%">Subscription Number:</td><td style="padding:8px 12px">${subscription.number}</td></tr><tr><td style="padding:8px 12px;font-weight:bold">Product:</td><td style="padding:8px 12px">${product.name}${subscription.variantName?` · ${subscription.variantName}`:''}</td></tr><tr style="background:#fafafa"><td style="padding:8px 12px;font-weight:bold">Current Plan:</td><td style="padding:8px 12px">${currentPlan.name||'Standard'} (${subscription.cycle||'Monthly'})</td></tr><tr><td style="padding:8px 12px;font-weight:bold">Expiry Date:</td><td style="padding:8px 12px;color:#b3261e;font-weight:bold">${subscription.ends}</td></tr><tr style="background:#fafafa"><td style="padding:8px 12px;font-weight:bold">Quantity & Rate:</td><td style="padding:8px 12px">${subscription.quantity} × ${fmt(subscription.unitPrice)}</td></tr></table><h3 style="font-size:15px;color:#192536;margin-bottom:10px">Available Plans for ${product.name}</h3><table style="width:100%;border-collapse:collapse;margin-bottom:24px;font-size:13px"><thead><tr style="background:#e8f0fe;color:#174ea6;text-align:left"><th style="padding:10px 14px">Plan</th><th style="padding:10px 14px">Price</th><th style="padding:10px 14px">Cycle</th><th style="padding:10px 14px">Min Qty</th></tr></thead><tbody>${plansHtml}</tbody></table><div style="text-align:center;margin:30px 0 20px"><a href="${appUrl}" style="background:#1967d2;color:#fff;text-decoration:none;padding:12px 28px;border-radius:24px;font-weight:bold;font-size:14px;display:inline-block">Sign In & Renew Plan</a></div><div style="border-top:1px solid #e0e0e0;padding-top:16px;margin-top:24px;font-size:12px;color:#757575"><p style="margin:0 0 6px">Questions? Reply to this email or sign in to your Brightloop customer portal.</p><p style="margin:0">Brightloop Software Inc. · Automated Subscription Management</p></div></div>`;
+  notify(customerUserId(subscription.customerId),headline,desc,`subscription-expiry-${stage}`,subscription.id);
+  notifyRoles(`Subscription Expiry Notice (${stage.replace('_',' ')})`,`${subscription.number} (${customer.name}) expires ${subscription.ends}.`,`subscription-expiry-${stage}-staff`,subscription.id);
+  if(process.env.SMTP_HOST){
+    try{
+      await nodemailer.createTransport({host:process.env.SMTP_HOST,port:Number(process.env.SMTP_PORT||587),secure:process.env.SMTP_PORT==='465',auth:process.env.SMTP_USER?{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS}:undefined}).sendMail({from:process.env.MAIL_FROM||'no-reply@brightloop.local',to:customer.email,subject,text:textBody,html:htmlBody});
+      audit({id:'system',name:'Automation'},`Sent ${stage} expiry email to ${customer.email} for ${subscription.number}`);
+    }catch(err){console.error(`Failed to send ${stage} expiry email to ${customer.email}:`,err.message);}
+  }else{
+    console.log(`[Expiry Email - ${stage}] to ${customer.email}: ${subject} (Expires: ${subscription.ends})`);
+  }
+}
 function subscriptionAutomation(){
   const today=new Date().toISOString().slice(0,10),plans=all('plans');
-  for(const subscription of all('subscriptions')){const plan=plans.find(p=>p.id===subscription.planId);if(plan?.autoClose===true&&subscription.ends&&subscription.ends<today&&!['Closed','Draft'].includes(subscription.status)){put('subscriptions',{...subscription,status:'Closed',closedReason:'Plan ended automatically'});notifyRoles('Subscription closed automatically',`${subscription.number||'Subscription'} reached its configured end date.`,'subscription-auto-closed',subscription.id);notify(customerUserId(subscription.customerId),'Subscription ended',`${subscription.number||'Your subscription'} reached its end date and was closed.`,'subscription-auto-closed-customer',subscription.id);}}
+  for(const subscription of all('subscriptions')){
+    if(['Closed','Draft'].includes(subscription.status))continue;
+    if(!subscription.ends)continue;
+    const todayMs=new Date(`${today}T00:00:00Z`).getTime();
+    const endMs=new Date(`${subscription.ends}T00:00:00Z`).getTime();
+    const daysRemaining=Math.round((endMs-todayMs)/86400000);
+    if(daysRemaining<=7&&daysRemaining>1)sendExpiryEmail(subscription,'week_before',daysRemaining).catch(e=>console.error('Expiry mail error',e.message));
+    if(daysRemaining<=1&&daysRemaining>0)sendExpiryEmail(subscription,'day_before',daysRemaining).catch(e=>console.error('Expiry mail error',e.message));
+    if(daysRemaining<=0)sendExpiryEmail(subscription,'on_expiry',daysRemaining).catch(e=>console.error('Expiry mail error',e.message));
+    const plan=plans.find(p=>p.id===subscription.planId);
+    if(plan?.autoClose===true&&daysRemaining<0){
+      put('subscriptions',{...subscription,status:'Closed',closedReason:'Plan ended automatically'});
+      notifyRoles('Subscription closed automatically',`${subscription.number||'Subscription'} reached its configured end date.`,'subscription-auto-closed',subscription.id);
+      notify(customerUserId(subscription.customerId),'Subscription ended',`${subscription.number||'Your subscription'} reached its end date and was closed.`,'subscription-auto-closed-customer',subscription.id);
+    }
+  }
 }
 function assertSubscriptionTransition(previous,next){
   if(!previous||previous===next)return;const allowed={Draft:['Quotation','Confirmed','Closed'],Quotation:['Confirmed','Closed'],Confirmed:['Active','Closed'],Active:['Paused','Closed'],Paused:['Active','Closed'],Closed:[]};if(!allowed[previous]?.includes(next))fail(`Subscription cannot move from ${previous} to ${next}.`);
@@ -219,4 +279,4 @@ server.listen(Number(process.env.PORT||3000),'127.0.0.1',()=>console.log(`Subscr
 const timer=setInterval(()=>{try{subscriptionAutomation();bill();quotationAutomation();}catch(e){console.error('Scheduled automation error',e.message);}},60000);timer.unref();
 
 server.on('close',()=>{clearInterval(timer);db.close();});
-export {server};
+export {server,sendExpiryEmail,subscriptionAutomation,db};
