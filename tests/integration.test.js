@@ -1,6 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {spawn} from 'node:child_process';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join,resolve,sep} from 'node:path';
@@ -9,11 +8,10 @@ import {once} from 'node:events';
 test('accounts, authorization, billing, payments and password recovery',async t=>{
   const dir=mkdtempSync(join(tmpdir(),'subscript-test-'));
   const port=13000+Math.floor(Math.random()*10000);
-  const child=spawn(process.execPath,['server.js'],{cwd:process.cwd(),env:{...process.env,PORT:String(port),APP_URL:`http://localhost:${port}`,DATA_DIR:dir,DEV_RESET_LINKS:'true',SMTP_HOST:''},stdio:['ignore','pipe','pipe']});
-  let output='';child.stdout.on('data',d=>output+=d);child.stderr.on('data',d=>output+=d);
-  t.after(async()=>{child.kill();if(child.exitCode===null)await once(child,'exit');const p=resolve(dir);if(p.startsWith(resolve(tmpdir())+sep)&&p.includes('subscript-test-'))rmSync(p,{recursive:true,force:true});});
-  for(let n=0;n<100&&!output.includes('running at');n++)await new Promise(r=>setTimeout(r,50));
-  assert.match(output,/running at/);
+  Object.assign(process.env,{PORT:String(port),APP_URL:`http://localhost:${port}`,DATA_DIR:dir,DEV_RESET_LINKS:'true',SMTP_HOST:''});
+  let output='';const originalLog=console.log;console.log=(...args)=>{output+=args.join(' ')+'\n';};
+  const {server}=await import('../server.js');if(!server.listening)await once(server,'listening');
+  t.after(async()=>{await new Promise(resolve=>server.close(resolve));console.log=originalLog;const p=resolve(dir);if(p.startsWith(resolve(tmpdir())+sep)&&p.includes('subscript-test-'))rmSync(p,{recursive:true,force:true});});
   const call=async(path,method='GET',body,cookie)=>{const r=await fetch(`http://127.0.0.1:${port}/api${path}`,{method,headers:{'Content-Type':'application/json',...(cookie?{cookie}:{})},body:body?JSON.stringify(body):undefined});return {status:r.status,body:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]};};
   const admin={email:'make_a_ton@gmail.com',password:'makeaton123'};
   assert.equal((await call('/state')).status,401);
@@ -40,7 +38,7 @@ test('accounts, authorization, billing, payments and password recovery',async t=
   assert.equal((await call('/invoice-action','POST',{id:invoice.id,action:'cancel'},cookie)).status,400);
   assert.equal((await call(`/records/subscriptions/${sub.id}`,'PATCH',{unitPrice:100},cookie)).status,400);
   await create('subscriptions',{number:'SUB-OTHER',customerId:second.id,productId:product.id,planId:plan.id,quantity:1,unitPrice:50,starts:today,status:'Draft'});
-  const customerPassword='Customer123';
+  const customerPassword='CustomerPass!42';
   assert.equal((await call('/auth/register','POST',{name:'Customer One',email:'one@example.com',password:customerPassword})).status,200);
   const customerLogin=await call('/auth/login','POST',{email:'one@example.com',password:customerPassword});assert.equal(customerLogin.body.user.role,'customer');
   const beforeLink=(await call('/state','GET',null,customerLogin.cookie)).body;assert.equal(beforeLink.subscriptions.length,0,'Registering with a matching email must not claim existing customer contracts.');
@@ -50,7 +48,7 @@ test('accounts, authorization, billing, payments and password recovery',async t=
   const quote=await create('quotations',{number:'QUO-TEST',customerId:customer.id,productId:product.id,planId:plan.id,quantity:1,unitPrice:50,starts:today,ends:today,status:'Draft'});
   assert.equal((await call('/convert','POST',{id:quote.id},cookie)).status,200);
   assert.equal((await call('/convert','POST',{id:quote.id},cookie)).status,400);
-  const staffPassword='Staffpass123';
+  const staffPassword='StaffPass!42';
   assert.equal((await call('/staff','POST',{name:'Staff',email:'staff@example.com',password:staffPassword},cookie)).status,200);
   const staff=await call('/auth/login','POST',{email:'staff@example.com',password:staffPassword});assert.equal(staff.body.user.role,'staff');
   assert.equal((await call('/records/taxes','POST',{name:'Forbidden',rate:50},staff.cookie)).status,403);

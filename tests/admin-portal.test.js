@@ -57,7 +57,7 @@ test('admin portal: login, staff management, customer accounts, summaries, rbac'
   assert.equal(typeof stats.body.totalCustomers, 'number');
 
   // 3. Create a customer and verify in /admin/customers and state
-  const custPass = 'CustomerPass123';
+  const custPass = 'CustomerPass!123';
   const regCust = await call('/auth/register', 'POST', {name: 'Jane Customer', email: 'jane@example.com', password: custPass});
   assert.equal(regCust.status, 200);
 
@@ -66,7 +66,7 @@ test('admin portal: login, staff management, customer accounts, summaries, rbac'
   assert.equal(adminCustomers.body.some(c => c.email === 'jane@example.com'), true);
 
   // 4. Staff Management: Add Staff
-  const staffPass = 'StaffSecret123';
+  const staffPass = 'StaffSecret!123';
   const createStaff = await call('/staff', 'POST', {name: 'Alice Support', email: 'alice@example.com', password: staffPass}, adminCookie);
   assert.equal(createStaff.status, 200);
 
@@ -100,7 +100,7 @@ test('admin portal: login, staff management, customer accounts, summaries, rbac'
   assert.equal(loginUpdated.body.user.name, 'Alice Operations');
 
   // 8. Staff Management: Reset Staff Password
-  const newStaffPass = 'NewStaffPass456';
+  const newStaffPass = 'NewStaffPass!456';
   const resetStaff = await call(`/staff/${alice.id}/reset`, 'POST', {password: newStaffPass}, adminCookie);
   assert.equal(resetStaff.status, 200);
 
