@@ -80,9 +80,26 @@ function validate(type,r){
     if(type==='subscriptions'&&!['Draft','Quotation','Confirmed','Active','Paused','Closed'].includes(r.status))fail('Invalid status.');
   }
 }
+// Staff access is scoped on the server; hiding navigation alone is insufficient.
+function assignedCustomer(user,id){
+  const customer=all('customers').find(c=>c.id===id&&c.assignedStaffId===user.id);
+  if(!customer)fail('Assigned customer not found.',404);
+  return customer;
+}
+function staffState(user){
+  const customers=all('customers').filter(c=>c.assignedStaffId===user.id);
+  const ids=new Set(customers.map(c=>c.id));
+  return {
+    customers:customers.map(({id,name,email,company,phone,notes})=>({id,name,email,company,phone,notes})),
+    subscriptions:all('subscriptions').filter(s=>ids.has(s.customerId)).map(({id,number,customerId,status,starts,ends,nextBilling,cycle})=>({id,number,customerId,status,starts,ends,nextBilling,cycle})),
+    tasks:all('staffTasks').filter(t=>t.assignedStaffId===user.id&&ids.has(t.customerId)),
+    support:all('staffSupport').filter(t=>ids.has(t.customerId)),
+    activity:db.prepare('SELECT time,action FROM audit WHERE userId=? ORDER BY id DESC LIMIT 50').all(user.id)
+  };
+}
 const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http://localhost');const path=url.pathname;const send=(data,code=200,headers={})=>{res.writeHead(code,{'Content-Type':'application/json','Cache-Control':'no-store',...headers});res.end(JSON.stringify(data));};try{
   res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('X-Frame-Options','DENY');res.setHeader('Referrer-Policy','same-origin');
-  if(!path.startsWith('/api/')){const files={'/':'index.html','/index.html':'index.html','/app.js':'app.js','/styles.css':'styles.css'};if(!files[path])return send({error:'Not found'},404);res.setHeader('Content-Type',path.endsWith('.js')?'text/javascript':path.endsWith('.css')?'text/css':'text/html');res.end(readFileSync(`${root}${files[path]}`));return;}
+  if(!path.startsWith('/api/')){const files={'/':'index.html','/index.html':'index.html','/app.js':'app.js','/staff.js':'staff.js','/styles.css':'styles.css'};if(!files[path])return send({error:'Not found'},404);res.setHeader('Content-Type',path.endsWith('.js')?'text/javascript':path.endsWith('.css')?'text/css':'text/html');res.end(readFileSync(`${root}${files[path]}`));return;}
   if(req.method!=='GET' && req.headers.origin && req.headers.origin!==`${req.headers['x-forwarded-proto']||'http'}://${req.headers.host}`)fail('Invalid request origin.',403);
   const b=req.method==='GET'?{}:await body(req);const email=String(b.email||'').trim().toLowerCase();
   if(path==='/api/auth/register'&&req.method==='POST'){
@@ -107,7 +124,60 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
   if(path==='/api/auth/me'&&req.method==='GET')return send({user:publicUser(u)});
   if(path==='/api/auth/logout'&&req.method==='POST'){db.prepare('DELETE FROM sessions WHERE token=?').run(hash(token));return send({ok:true},200,{'Set-Cookie':'session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'});}
   if(path==='/api/profile'&&req.method==='POST'){if(!b.name?.trim())fail('Name is required.');db.prepare('UPDATE users SET name=? WHERE id=?').run(b.name.trim(),u.id);return send({user:{...publicUser(u),name:b.name.trim()}});}
+  if(path==='/api/state'&&req.method==='GET'&&u.role==='staff')return send(staffState(u));
   if(path==='/api/state'&&req.method==='GET'){const data=Object.fromEntries(types.map(t=>[t,all(t)]));if(u.role==='customer'){const ids=data.customers.filter(c=>c.userId===u.id).map(c=>c.id);for(const t of ['subscriptions','quotations','invoices'])data[t]=data[t].filter(r=>ids.includes(r.customerId));const invoices=data.invoices.map(i=>i.id);data.payments=data.payments.filter(p=>invoices.includes(p.invoiceId));data.customers=data.customers.filter(c=>ids.includes(c.id));data.products=data.products.filter(p=>data.subscriptions.some(s=>s.productId===p.id)).map(({id,name,price})=>({id,name,price}));data.discounts=[];data.taxes=[];}return send(data);}
+  if(path==='/api/staff/password'&&req.method==='POST'){
+    if(u.role!=='staff')fail('Staff access required.',403);
+    throttle(`password:${u.id}`);
+    const [salt,saved]=u.password.split(':');
+    if(!timingSafeEqual(scryptSync(String(b.currentPassword||''),salt,64),Buffer.from(saved,'hex')))fail('Current password is incorrect.');
+    if(!validPassword(b.password))fail('Use at least 8 characters with a letter and a number.');
+    if(b.password===b.currentPassword)fail('Choose a different password.');
+    db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(b.password),u.id);
+    db.prepare('DELETE FROM sessions WHERE userId=? AND token<>?').run(u.id,hash(token));
+    db.prepare('DELETE FROM resets WHERE userId=?').run(u.id);
+    audit(u,'Changed password');return send({ok:true});
+  }
+  if(path==='/api/staff/tasks'&&req.method==='POST'&&u.role==='admin'){
+    if(!db.prepare("SELECT id FROM users WHERE id=? AND role='staff'").get(String(b.assignedStaffId||'')))fail('Choose a staff member.');
+    const c=all('customers').find(c=>c.id===b.customerId&&c.assignedStaffId===b.assignedStaffId);
+    if(!c)fail('Assign this customer to that staff member first.');
+    if(!String(b.title||'').trim()||String(b.title).length>200)fail('Enter a task title under 200 characters.');
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(b.due||'')||!Number.isFinite(Date.parse(b.due)))fail('Enter a valid due date.');
+    const task=put('staffTasks',{id:uid(),customerId:c.id,assignedStaffId:b.assignedStaffId,title:b.title.trim(),due:b.due,status:'Open'});
+    audit(u,'Assigned staff task');return send(task);
+  }
+  if(u.role==='staff'){
+    const route=path.match(/^\/api\/staff\/(customers|tasks|support)(?:\/([a-f0-9]+))?$/);
+    if(!route)fail('Administrator access required.',403);
+    const [,kind,id]=route;
+    if(kind==='customers'&&id&&req.method==='PATCH'){
+      const c=assignedCustomer(u,id),changes={};
+      if(Object.keys(b).some(k=>!['name','company','phone','notes'].includes(k)))fail('Staff may only update customer contact details and notes.',403);
+      for(const [k,v] of Object.entries(b)){if(typeof v!=='string'||v.length>2000)fail('Enter valid customer details.');changes[k]=v.trim();}
+      if(changes.name!==undefined&&!changes.name)fail('Name is required.');
+      put('customers',{...c,...changes});audit(u,`Updated assigned customer ${c.name}`);return send({ok:true});
+    }
+    if(kind==='tasks'&&id&&req.method==='PATCH'){
+      const task=all('staffTasks').find(t=>t.id===id&&t.assignedStaffId===u.id);
+      if(!task)fail('Assigned task not found.',404);assignedCustomer(u,task.customerId);
+      if(!['Open','In progress','Completed'].includes(b.status))fail('Choose a valid task status.');
+      put('staffTasks',{...task,status:b.status});audit(u,`Task ${b.status}: ${task.title}`);return send({ok:true});
+    }
+    if(kind==='support'&&!id&&req.method==='POST'){
+      const c=assignedCustomer(u,b.customerId);
+      if(!['Support request','Service follow-up','Contact note'].includes(b.kind))fail('Choose a service action.');
+      if(typeof b.notes!=='string'||!b.notes.trim()||b.notes.length>2000)fail('Enter notes under 2000 characters.');
+      const entry=put('staffSupport',{id:uid(),customerId:c.id,kind:b.kind,notes:b.notes.trim(),status:'Open',createdAt:new Date().toISOString(),createdBy:u.id});
+      audit(u,`${b.kind} logged for ${c.name}`);return send(entry);
+    }
+    if(kind==='support'&&id&&req.method==='PATCH'){
+      const entry=all('staffSupport').find(t=>t.id===id);if(!entry)fail('Service record not found.',404);assignedCustomer(u,entry.customerId);
+      if(!['Open','In progress','Resolved'].includes(b.status))fail('Choose a valid service status.');
+      put('staffSupport',{...entry,status:b.status});audit(u,`Service ${b.status}: ${entry.kind}`);return send({ok:true});
+    }
+    fail('Staff action not allowed.',403);
+  }
   if(u.role==='customer')fail('You do not have permission to perform this action.',403);
   if(path==='/api/team'&&req.method==='GET'){if(u.role!=='admin')fail('Administrator access required.',403);return send(db.prepare('SELECT id,name,email,role FROM users WHERE role IN (\'admin\',\'staff\')').all());}
   if(path==='/api/invoice-action'&&req.method==='POST'){
@@ -127,10 +197,13 @@ const server=http.createServer(async(req,res)=>{const url=new URL(req.url,'http:
     const old=id?all(type).find(r=>r.id===id):undefined;if(id&&!old)fail('Record not found.',404);let r={...old,...b,id:id||uid()};delete r.password;
     if(type==='invoices')fail('Invoices are generated from subscriptions. Use invoice actions.');
     if(type==='payments'){if(id)fail('Payments cannot be edited.');validate(type,r);const i=all('invoices').find(i=>i.id===r.invoiceId);if(!i||i.status==='Cancelled')fail('Choose a confirmed invoice.');const paid=all('payments').filter(p=>p.invoiceId===i.id).reduce((s,p)=>s+Number(p.amount),0);if(!(Number(r.amount)>0)||Number(r.amount)>i.total-paid+0.001)fail('Amount exceeds the outstanding balance or is invalid.');if(!r.date||!['Bank transfer','Card','Cash','Other'].includes(r.method))fail('Payment date and method are required.');db.exec('BEGIN IMMEDIATE');try{put(type,r);put('invoices',{...i,status:paid+Number(r.amount)>=i.total-0.001?'Paid':'Confirmed'});db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}}
-    else {validate(type,r);if(type==='subscriptions'){if(old&&old.status==='Closed'&&r.status!=='Closed')fail('Renew a closed subscription as a new contract.');if(old&&all('invoices').some(i=>i.subscriptionId===id)&&['starts','customerId','productId','quantity','unitPrice','planId'].some(k=>String(old[k])!==String(r[k])))fail('Billed contract details cannot be changed. Create a new subscription for pricing changes.');r.nextBilling=old?.nextBilling||r.starts;}if(type==='customers'){const account=db.prepare('SELECT id FROM users WHERE email=? AND role=?').get(r.email,'customer');r.userId=account?.id||null;}if(type==='quotations'&&old?.subscriptionId)r.subscriptionId=old.subscriptionId;if(type==='discounts')r.used=old?.used||0;put(type,r);}audit(u,`${id?'Updated':'Created'} ${type}: ${r.id}`);return send(r);
+    else {validate(type,r);if(type==='subscriptions'){if(old&&old.status==='Closed'&&r.status!=='Closed')fail('Renew a closed subscription as a new contract.');if(old&&all('invoices').some(i=>i.subscriptionId===id)&&['starts','customerId','productId','quantity','unitPrice','planId'].some(k=>String(old[k])!==String(r[k])))fail('Billed contract details cannot be changed. Create a new subscription for pricing changes.');r.nextBilling=old?.nextBilling||r.starts;}if(type==='customers'){if(r.assignedStaffId&&!db.prepare("SELECT id FROM users WHERE id=? AND role='staff'").get(r.assignedStaffId))fail('Choose a valid staff member.');const account=db.prepare('SELECT id FROM users WHERE email=? AND role=?').get(r.email,'customer');r.userId=account?.id||null;}if(type==='quotations'&&old?.subscriptionId)r.subscriptionId=old.subscriptionId;if(type==='discounts')r.used=old?.used||0;put(type,r);}audit(u,`${id?'Updated':'Created'} ${type}: ${r.id}`);return send(r);
   }
   if(req.method==='DELETE'){if(['payments','invoices','subscriptions'].includes(type))fail('Financial records are retained. Close or cancel them instead.');const references={customers:['customerId'],products:['productId'],plans:['planId'],discounts:['discountId'],taxes:['taxId']};if(types.some(t=>all(t).some(r=>(references[type]||[]).some(key=>r[key]===id))))fail('This record is in use and cannot be deleted.');db.prepare('DELETE FROM records WHERE id=? AND type=?').run(id,type);audit(u,`Deleted ${type}: ${id}`);return send({ok:true});}
   fail('Method not allowed',405);
 }catch(e){send({error:e.code&&typeof e.code==='number'?e.message:'The request could not be completed.'},typeof e.code==='number'?e.code:500);if(!e.code)console.error(e);}});
 server.listen(Number(process.env.PORT||3000),'127.0.0.1',()=>console.log(`Subscript running at ${process.env.APP_URL||'http://localhost:3000'}`));
 const timer=setInterval(()=>{try{bill();}catch(e){console.error('Billing error',e.message);}},60000);timer.unref();
+
+server.on('close',()=>{clearInterval(timer);db.close();});
+export {server};

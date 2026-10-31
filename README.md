@@ -58,3 +58,13 @@ Integration tests exercise authentication, authorization, billing idempotency, t
 This is a working local MVP. Payments are recorded manually; no payment processor charges cards. Customer portals currently provide read access and invoice printing. Product variants are represented as separate products/notes. Contracts currently have a single product line. Advanced quotation templates, prorations, payment retries, customer plan changes, email verification, recurring reminder emails and multi-tenant workspaces are future work. Availability filters and the chart use UTC billing dates. Large datasets are loaded into memory; pagination and performance work are needed before claiming the PDF's two-second target at scale.
 
 The server binds to loopback. Before hosting, configure HTTPS, secure cookies and SMTP, and replace first-registration administrator setup with an explicit deployment bootstrap. Back up SQLite data and use a supervised scheduler if the app must bill while its UI is closed or its process restarts. Fonts load from Google Fonts with Arial fallback.
+
+## Staff portal
+
+Administrators create staff from Team access, assign customers from Customers → Edit → Assigned staff, and assign dated tasks from Team access → Assign staff work. Existing customers are unassigned by default. Staff see only assigned customer records and subscription status. Staff can edit names, companies, phone numbers and notes; account email, portal links, assignments, subscriptions, billing and catalog administration remain administrator-controlled.
+
+The staff dashboard shows assigned work, service counts and today’s activity in the browser’s local date. Staff can track task progress, log internal support requests, service follow-ups and contact notes, resolve service entries, edit their profile and change their password using their current password. Password changes invalidate other sessions and reset links. Service actions are internal records and do not send email. Reassigning a customer immediately removes the previous staff member’s access to that customer, subscriptions, tasks and support records.
+
+The existing customer portal and shared sign-in remain in place. Staff data filtering and mutation restrictions are enforced on the server, including requests made outside the UI. Minimal admin assignment controls support the staff workflow.
+
+Run `npm test`, or run the suites directly with `node tests/integration.test.js` and `node tests/staff-security.test.js` in environments that block child-process test isolation. Tests use isolated temporary databases and close their database connections during cleanup.
