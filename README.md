@@ -25,6 +25,7 @@ The application has three separate role experiences: administrator, staff and cu
 - Profile page and role restrictions enforced by the backend.
 - Create, edit and search products, plans, customers, discount rules and tax rules.
 - Quotation creation and conversion to a confirmed subscription.
+- Persistent in-app notifications for admin, staff and customers, including quotation submission, expiry reminders, expiry, and conversion updates.
 - Subscription activation, pause, close and renewal through a new contract.
 - Recurring invoices generated from active subscriptions, once per billing period; discounts and taxes calculated automatically.
 - Record partial/full payments, reject overpayments and track outstanding/overdue balances.
