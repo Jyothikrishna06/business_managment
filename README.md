@@ -23,6 +23,7 @@ The application has three separate role experiences: administrator, staff and cu
 - Profile page and role restrictions enforced by the backend.
 - Aira Band customer dashboard with device connection state, activity rings and demo health readings for steps, calories, distance, exercise, heart rate, blood oxygen, sleep and recovery.
 - Customer catalog for Aira Loop, Active, Weave, Fit and Sense, using the supplied product photos with model-specific prototype specifications and three membership plans per band.
+- Customer Store excludes the connected Aira Loop, presents the other four products in image-led cards, and opens a three-plan subscription comparison with the middle plan recommended.
 - Create, edit and search products, plans, customers, discount rules and tax rules.
 - Quotation creation and conversion to a confirmed subscription.
 - Subscription activation, pause, close and renewal through a new contract.
