@@ -28,7 +28,19 @@ function ensureBootstrapAdmin(){
   const existing=db.prepare('SELECT id FROM users WHERE email=?').get(email);
   if(!existing) db.prepare('INSERT INTO users VALUES(?,?,?,?,?,?)').run(uid(),'Make A Ton Admin',email,passwordHash(password),'admin','active');
 }
+function ensureBootstrapDefaults(){
+  if(process.env.DATA_DIR && process.env.DATA_DIR.includes('-test-')) return;
+  if(all('taxes').length===0){
+    const taxes=[{id:uid(),name:'GST 18% (Standard SaaS)',rate:18},{id:uid(),name:'GST 12% (IT Services)',rate:12},{id:uid(),name:'GST 5% (Concessional)',rate:5},{id:uid(),name:'Zero Tax (0% Export / Exempt)',rate:0}];
+    for(const t of taxes)put('taxes',t);
+  }
+  if(all('discounts').length===0){
+    const discounts=[{id:uid(),name:'Launch Offer 10%',kind:'Percentage',value:10,minQuantity:1},{id:uid(),name:'Festive Deal 20%',kind:'Percentage',value:20,minQuantity:1},{id:uid(),name:'Flat ₹100 Off',kind:'Fixed',value:100,minQuantity:1},{id:uid(),name:'Volume Tier ₹500 Off',kind:'Fixed',value:500,minQuantity:5}];
+    for(const d of discounts)put('discounts',d);
+  }
+}
 ensureBootstrapAdmin();
+ensureBootstrapDefaults();
 function calculate(s,date){
   const product=all('products').find(p=>p.id===s.productId); const quantity=Number(s.quantity); const subtotal=Number(s.unitPrice ?? product?.price ?? 0)*quantity;
   const discount=all('discounts').find(d=>d.id===s.discountId);
@@ -86,7 +98,9 @@ function validate(type,r){
   if(r.starts&&r.ends&&r.ends<r.starts)fail('End date must follow start date.');
   if(['subscriptions','quotations'].includes(type)){
     if(!all('customers').some(c=>c.id===r.customerId))fail('Choose a customer.');
-    if(!all('products').some(c=>c.id===r.productId))fail('Choose a product.');
+    let prod=all('products').find(p=>p.id===r.productId||p.key===r.productId||(r.productId&&p.name.trim().toLowerCase()===String(r.productId).trim().toLowerCase()));
+    if(!prod&&r.planId){const pl=all('plans').find(p=>p.id===r.planId);if(pl?.productId)prod=all('products').find(p=>p.id===pl.productId);}
+    if(!prod)fail('Choose a product.');r.productId=prod.id;
     const plan=all('plans').find(c=>c.id===r.planId);if(!plan)fail('Choose a plan.');
     if(!Number.isFinite(Number(r.unitPrice))||!Number.isInteger(Number(r.quantity))||Number(r.quantity)<Math.max(1,Number(plan.minQuantity||1)))fail('Enter a valid price and a whole quantity above the plan minimum.');
     if((plan.starts&&r.starts<plan.starts)||(plan.ends&&r.starts>plan.ends))fail('The plan is unavailable on this start date.');
